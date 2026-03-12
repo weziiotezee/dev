@@ -936,7 +936,6 @@ local Tabs = {
     Fishing = Window:AddTab({ Title = "Auto Fish", Icon = "anchor" }),
     Hop = Window:AddTab({ Title = "Auto Hop", Icon = "globe" }),
     Merchant = Window:AddTab({ Title = "NPC Alerts", Icon = "bell" }),
-    Monitor = Window:AddTab({ Title = "System Cache", Icon = "server" }),
     Webhook = Window:AddTab({ Title = "Settings", Icon = "settings" })
 }
 
@@ -1070,6 +1069,8 @@ AutoCraftToggle:OnChanged(function(Value)
     SaveConfig()
 end)
 
+Tabs.Fishing:AddParagraph({ Title = "⚠️ Important", Content = "Please close the Chat Box before enabling Auto Fish to prevent accidental clicks." })
+
 local FishStatusLabel = Tabs.Fishing:AddParagraph({ Title = "Status", Content = "Idle" })
 local FishBagLabel = Tabs.Fishing:AddParagraph({ Title = "Fish in Bag", Content = currentFishCount .. " / " .. targetFishCount })
 
@@ -1185,40 +1186,6 @@ Tabs.Merchant:AddButton({
         Fluent:Notify({ Title = "Webhook Test", Content = "Test payload sent for Jester.", Duration = 3 })
     end
 })
-
-local SysMemLabel = Tabs.Monitor:AddParagraph({ Title = "Memory (RAM) Usage", Content = "-- MB" })
-local SysCacheLabel = Tabs.Monitor:AddParagraph({ Title = "Cache Status", Content = "Waiting..." })
-local SysLoopLabel = Tabs.Monitor:AddParagraph({ Title = "Background Tasks", Content = "Waiting..." })
-
-local function CountDictionary(dict)
-    local count = 0
-    if type(dict) == "table" then
-        for _ in pairs(dict) do count = count + 1 end
-    end
-    return count
-end
-
-task.spawn(function()
-    while task.wait(1) do
-        pcall(function()
-            local mem = math.floor(collectgarbage("count") / 1024)
-            SysMemLabel:SetDesc(mem .. " MB (If > 1000MB, game might lag)")
-            
-            local cacheStr = string.format("Scanned Items: %d\nCached Target Buttons: %d\nFish Button Found: %s\nAction Button Found: %s\nAura Queue: %d", 
-                #ScannedItemsList, 
-                CountDictionary(CachedTargetButtons), 
-                (cachedFishBtn and "Yes" or "No"),
-                (cachedExtraBtn and "Yes" or "No"),
-                #AuraQueue)
-            SysCacheLabel:SetDesc(cacheStr)
-            
-            local loopStr = string.format("Auto Fish Active: %s\nSelling Process: %s", 
-                tostring(autoFarmEnabled), 
-                tostring(isSellingProcess))
-            SysLoopLabel:SetDesc(loopStr)
-        end)
-    end
-end)
 
 local WhIntervalSlider = Tabs.Webhook:AddSlider("WhInterval", { Title = "Send Interval (Seconds)", Description = "Time between saves", Default = HubConfig.WhInterval, Min = 10, Max = 60, Rounding = 1 })
 WhIntervalSlider:OnChanged(function(Value) 
@@ -2068,59 +2035,9 @@ task.spawn(function()
     end
 end)
 
-local DebugGui = Instance.new("ScreenGui")
-DebugGui.Name = "XT_FishingDebug"
-DebugGui.IgnoreGuiInset = false
-pcall(function() DebugGui.Parent = game:GetService("CoreGui") end)
-if not DebugGui.Parent then DebugGui.Parent = player:WaitForChild("PlayerGui") end
-
-local function CreateDebugBox(name, color)
-    local frame = Instance.new("Frame")
-    frame.Name = name
-    frame.BackgroundColor3 = color
-    frame.BackgroundTransparency = 0.7
-    frame.BorderSizePixel = 2
-    frame.BorderColor3 = color
-    frame.Visible = false
-    frame.Parent = DebugGui
-    
-    local label = Instance.new("TextLabel")
-    label.Text = name
-    label.Size = UDim2.new(1, 0, 0, 20)
-    label.Position = UDim2.new(0, 0, 0, -20)
-    label.BackgroundTransparency = 1
-    label.TextColor3 = color
-    label.TextStrokeTransparency = 0
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 12
-    label.Parent = frame
-    
-    return frame
-end
-
-local Box_FishUI = CreateDebugBox("Fish UI (Size)", Color3.fromRGB(0, 255, 0))
-local Box_MiniUI = CreateDebugBox("Minigame UI (Size)", Color3.fromRGB(255, 255, 0))
-local Box_ActionUI = CreateDebugBox("Action UI (Size)", Color3.fromRGB(255, 0, 0))
-local Box_FishBtn = CreateDebugBox("Fish Button", Color3.fromRGB(0, 255, 100))
-local Box_ExtraBtn = CreateDebugBox("Action Button", Color3.fromRGB(0, 100, 255))
-
-local function UpdateBox(box, element)
-    if not autoFarmEnabled then box.Visible = false return end
-    if element and element.Parent and element.Visible and element.AbsoluteSize.X > 0 then
-        box.Size = UDim2.new(0, element.AbsoluteSize.X, 0, element.AbsoluteSize.Y)
-        box.Position = UDim2.new(0, element.AbsolutePosition.X, 0, element.AbsolutePosition.Y)
-        box.Visible = true
-    else
-        box.Visible = false
-    end
-end
-
 task.spawn(function()
     while task.wait(0.2) do
         if not autoFarmEnabled then 
-            UpdateBox(Box_FishUI, nil)
-            UpdateBox(Box_MiniUI, nil)
-            UpdateBox(Box_ActionUI, nil)
             continue 
         end
         local mainUI = playerGui:FindFirstChild("MainInterface")
@@ -2150,10 +2067,6 @@ task.spawn(function()
         DetectFish_ON = fishOn
         DetectMinigame_ON = miniOn
         DetectAction_ON = actOn
-
-        UpdateBox(Box_FishUI, fUI)
-        UpdateBox(Box_MiniUI, mUI)
-        UpdateBox(Box_ActionUI, aUI)
     end
 end)
 
@@ -2389,7 +2302,7 @@ task.spawn(function()
                                                                                 break
                                                                             end
                                                                         end
-                                                                    end
+                                                                   end
                                                                 end
                                                             end
                                                         end
@@ -2635,8 +2548,6 @@ task.spawn(function()
             isRecoveryMode = false
             actionFirstDetected = 0
             
-            UpdateBox(Box_FishBtn, nil)
-            UpdateBox(Box_ExtraBtn, nil)
             continue 
         end
         
@@ -2646,7 +2557,7 @@ task.spawn(function()
             continue 
         end
 
-        if tick() - lastFishingStepTime > 48 and not isRecoveryMode then
+        if tick() - lastFishingStepTime > 38 and not isRecoveryMode then
             isRecoveryMode = true
             if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ UI Stuck! Recovering...") end
             
@@ -2683,7 +2594,6 @@ task.spawn(function()
             if DetectFish_ON then
                 fishBtn = getFishButton(mainUI)
             end
-            UpdateBox(Box_FishBtn, fishBtn) 
 
             local isFishVisible = false
             if fishBtn and fishBtn.Visible then
@@ -2711,33 +2621,29 @@ task.spawn(function()
                 end
 
             elseif fishingStep == 2 then
-                -- จบมินิเกม
+                -- จบมินิเกม รีเซ็ตเวลารอเอาไว้ก่อน
                 if not DetectMinigame_ON or not isMinigameActive then
                     fishingStep = 3 
                     lastFishingStepTime = tick()
-                    actionFirstDetected = tick() -- ใช้เก็บเวลาที่ Minigame จบ
+                    actionFirstDetected = 0 
                 end
 
             elseif fishingStep == 3 then
-                -- เช็คว่าผ่านไป 2 วินาทีหลังจาก Minigame จบหรือยัง
-                if tick() - actionFirstDetected < 2.0 then
-                    if FishStatusLabel then FishStatusLabel:SetDesc(string.format("⏳ Minigame Ended! Wait %.1fs...", 2.0 - (tick() - actionFirstDetected))) end
-                    -- รอจนครบ 2 วินาที ถึงจะให้ไปหาสเต็ปถัดไป
-                else
-                    local extraBtn = nil
-                    if DetectAction_ON then
-                        extraBtn = getExtraButton(mainUI)
-                    end
-                    UpdateBox(Box_ExtraBtn, extraBtn) 
+                local extraBtn = nil
+                if DetectAction_ON then
+                    extraBtn = getExtraButton(mainUI)
+                end
 
-                    local isActionVisible = (extraBtn and extraBtn.Visible)
+                local isActionVisible = (extraBtn and extraBtn.Visible)
+                
+                if isActionVisible then
+                    -- ถ่าปุ่มขึ้นมาแล้วจริงๆ ค่อยเริ่มจับเวลา 2 วินาที
+                    if actionFirstDetected == 0 then
+                        actionFirstDetected = tick()
+                    end
                     
-                    if isActionVisible then
+                    if tick() - actionFirstDetected >= 2.0 then
                         if FishStatusLabel then FishStatusLabel:SetDesc("⚙️ Clicking Action Button...") end
-                        
-                        -- ✅ นำระบบ Recovery Mode (กด 2 วิธีควบคู่กัน) มาใช้ยืนยันการกด Action ให้ชัวร์ 100%
-                        clickOnce() 
-                        task.wait(0.2)
                         forceFishClick(extraBtn)
                         
                         currentFishCount = currentFishCount + 1
@@ -2752,7 +2658,7 @@ task.spawn(function()
                         
                         if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Delay 2s (Action -> Fish)...") end
                         lastFishingStepTime = tick() 
-                        task.wait(2.0) -- Delay 2 วิ ก่อนกลับไป Fish ใหม่
+                        task.wait(2.0) -- Delay 2 วิ ก่อนกลับไป Fish
                         
                         fishingStep = 0
                         hasMinigameMoved = false
@@ -2762,15 +2668,19 @@ task.spawn(function()
                         if FishStatusLabel then FishStatusLabel:SetDesc("🚶 Resetting Position to fix UI bug...") end
                         isResettingUI = true 
                     else
-                        -- กรณีที่ปุ่มไม่โผล่แต่ Fish โผล่แทน (เช่นพลาดจังหวะเกม)
-                        if DetectFish_ON and isFishVisible then
-                            fishingStep = 0
-                            hasMinigameMoved = false
-                            lastFishingStepTime = tick()
-                            actionFirstDetected = 0
-                        else
-                            if FishStatusLabel then FishStatusLabel:SetDesc("🔍 Waiting for Action Button...") end
-                        end
+                        -- นับถอยหลังให้เห็นใน UI
+                        if FishStatusLabel then FishStatusLabel:SetDesc(string.format("⏳ Action found! Wait %.1fs...", 2.0 - (tick() - actionFirstDetected))) end
+                    end
+                else
+                    -- ถ้าปุ่มหายไปกระทันหัน ให้ยกเลิกการนับเวลาไปก่อน
+                    actionFirstDetected = 0
+                    
+                    if DetectFish_ON and isFishVisible then
+                        fishingStep = 0
+                        hasMinigameMoved = false
+                        lastFishingStepTime = tick()
+                    else
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🔍 Waiting for Action Button...") end
                     end
                 end
             end
