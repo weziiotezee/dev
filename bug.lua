@@ -2426,15 +2426,26 @@ task.spawn(function()
                 local xScl = child.Size.X.Scale
                 local bg = child.BackgroundTransparency
 
-                -- Fish UI: ตรวจ size ปกติ + เพิ่มเช็ค BG == 0.40 (เฉพาะ Fish เท่านั้น)
+                -- Fish UI: size match + BG == 0.40 (±0.15 tolerance รองรับ fade-in)
                 if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
-                    fishOn = math.abs(bg - 0.40) < 0.05
+                    fishOn = (bg <= 0.6)
 
                 -- Minigame UI: ตรวจ size + BG active ปกติ
                 elseif math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
                     miniOn = (bg <= 0.6)
                 end
             end
+        end
+
+        -- Fish fallback: ถ้า size scan ไม่เจอ ให้ตรวจจาก getFishButton โดยตรง
+        -- ครอบคลุมกรณีที่ BG กำลัง animate หรือ size ต่างจาก constant เล็กน้อย
+        if not fishOn then
+            pcall(function()
+                local btn = getFishButton(mainUI)
+                if btn and btn.Visible and btn.AbsoluteSize.X > 0 then
+                    fishOn = true
+                end
+            end)
         end
 
         -- Action UI: ตรวจจาก exact path แทน size
@@ -2994,7 +3005,8 @@ task.spawn(function()
             -- ============================================================
             -- ดึงสถานะ UI ทั้งหมดก่อน แล้วค่อยตัดสิน step
             -- ============================================================
-            local fishBtn = DetectFish_ON and getFishButton(mainUI) or nil
+            -- ดึง Fish button โดยตรง ไม่รอ DetectFish_ON เพื่อครอบคลุม fade-in ช่วงเปลี่ยนรอบ
+            local fishBtn = getFishButton(mainUI)
             local isFishVisible = false
             if fishBtn then
                 local ok, vis = pcall(function() return fishBtn.Visible end)
@@ -3002,6 +3014,10 @@ task.spawn(function()
                     local tl = fishBtn:FindFirstChildWhichIsA("TextLabel")
                     isFishVisible = tl and tl.Visible or (not tl)
                 end
+            end
+            -- sync DetectFish_ON ถ้าเจอปุ่มโดยตรง (ป้องกัน detect loop lag)
+            if isFishVisible and not DetectFish_ON then
+                DetectFish_ON = true
             end
 
             -- หา Action container + button ด้วย exact path
