@@ -1240,7 +1240,203 @@ task.spawn(function()
 end)
 -- ────────────────────────────────────────────────────────────
 
-local AutoFishToggle = Tabs.Fishing:AddToggle("AutoFishToggle", { Title = "Enable Auto Fish", Default = HubConfig.AutoFish })
+-- ── Show Detect Overlay ──────────────────────────────────────
+local showDetectOverlay = false
+
+local ShowDetectToggle = Tabs.Fishing:AddToggle("ShowDetectToggle", {
+    Title = "Show Detect Overlay",
+    Default = false
+})
+ShowDetectToggle:OnChanged(function(Value)
+    showDetectOverlay = Value
+end)
+
+-- ScreenGui สำหรับวาดกรอบ (แยกจาก UI หลัก ป้องกัน conflict)
+local overlayGui = Instance.new("ScreenGui")
+overlayGui.Name = "DetectOverlayGui"
+overlayGui.ResetOnSpawn = false
+overlayGui.IgnoreGuiInset = true
+overlayGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+overlayGui.DisplayOrder = 999
+pcall(function()
+    overlayGui.Parent = (gethui and gethui()) or playerGui
+end)
+if not overlayGui.Parent then overlayGui.Parent = playerGui end
+
+-- ฟังก์ชันสร้าง/อัปเดตกรอบสี่เหลี่ยม 4 เส้น (top/bottom/left/right)
+local function makeBox(name, color)
+    local box = {}
+    local sides = {"Top","Bottom","Left","Right"}
+    for _, side in ipairs(sides) do
+        local f = Instance.new("Frame")
+        f.Name = name .. "_" .. side
+        f.BackgroundColor3 = color
+        f.BorderSizePixel = 0
+        f.ZIndex = 1000
+        f.Parent = overlayGui
+        box[side] = f
+    end
+    return box
+end
+
+local function updateBox(box, ax, ay, aw, ah, thickness)
+    thickness = thickness or 2
+    -- Top
+    box.Top.Position    = UDim2.new(0, ax,           0, ay)
+    box.Top.Size        = UDim2.new(0, aw,            0, thickness)
+    -- Bottom
+    box.Bottom.Position = UDim2.new(0, ax,           0, ay + ah - thickness)
+    box.Bottom.Size     = UDim2.new(0, aw,            0, thickness)
+    -- Left
+    box.Left.Position   = UDim2.new(0, ax,           0, ay)
+    box.Left.Size       = UDim2.new(0, thickness,     0, ah)
+    -- Right
+    box.Right.Position  = UDim2.new(0, ax + aw - thickness, 0, ay)
+    box.Right.Size      = UDim2.new(0, thickness,     0, ah)
+end
+
+local function setBoxVisible(box, visible)
+    for _, f in pairs(box) do f.Visible = visible end
+end
+
+-- สร้างกรอบสีต่างๆ สำหรับแต่ละ element
+local boxFish     = makeBox("Fish",     Color3.fromRGB(80,  200, 120))  -- เขียว
+local boxMini     = makeBox("Minigame", Color3.fromRGB(80,  160, 255))  -- น้ำเงิน
+local boxAction   = makeBox("Action",   Color3.fromRGB(255, 180,  50))  -- ส้ม
+local boxConfirm  = makeBox("Confirm",  Color3.fromRGB(255,  80,  80))  -- แดง
+
+-- Label แสดงชื่อกรอบ
+local function makeLabel(name, color)
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = name .. "_Label"
+    lbl.BackgroundColor3 = color
+    lbl.BackgroundTransparency = 0.3
+    lbl.TextColor3 = Color3.new(1,1,1)
+    lbl.TextSize = 11
+    lbl.Font = Enum.Font.GothamBold
+    lbl.Size = UDim2.new(0, 60, 0, 16)
+    lbl.ZIndex = 1001
+    lbl.Text = name
+    lbl.Parent = overlayGui
+    return lbl
+end
+
+local lblFish    = makeLabel("Fish",     Color3.fromRGB(80,  200, 120))
+local lblMini    = makeLabel("Minigame", Color3.fromRGB(80,  160, 255))
+local lblAction  = makeLabel("Action",   Color3.fromRGB(255, 180,  50))
+local lblConfirm = makeLabel("Confirm",  Color3.fromRGB(255,  80,  80))
+
+local inset = guiService:GetGuiInset()
+
+task.spawn(function()
+    while task.wait(0.1) do
+        -- ซ่อนทุกกรอบถ้าปิด overlay
+        if not showDetectOverlay then
+            setBoxVisible(boxFish, false)
+            setBoxVisible(boxMini, false)
+            setBoxVisible(boxAction, false)
+            setBoxVisible(boxConfirm, false)
+            lblFish.Visible, lblMini.Visible, lblAction.Visible, lblConfirm.Visible = false, false, false, false
+            continue
+        end
+
+        pcall(function()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
+            if not mainUI then
+                setBoxVisible(boxFish, false); setBoxVisible(boxMini, false)
+                setBoxVisible(boxAction, false); setBoxVisible(boxConfirm, false)
+                lblFish.Visible, lblMini.Visible, lblAction.Visible, lblConfirm.Visible = false, false, false, false
+                return
+            end
+
+            -- ── Fish UI ──
+            local fishFound = false
+            for _, child in ipairs(mainUI:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    local xOff, xScl = child.Size.X.Offset, child.Size.X.Scale
+                    if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
+                        local ap = child.AbsolutePosition
+                        local as = child.AbsoluteSize
+                        updateBox(boxFish, ap.X, ap.Y + inset.Y, as.X, as.Y)
+                        setBoxVisible(boxFish, true)
+                        lblFish.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                        lblFish.Visible = true
+                        fishFound = true
+                        break
+                    end
+                end
+            end
+            if not fishFound then setBoxVisible(boxFish, false); lblFish.Visible = false end
+
+            -- ── Minigame UI ──
+            local miniFound = false
+            for _, child in ipairs(mainUI:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    local xOff, xScl = child.Size.X.Offset, child.Size.X.Scale
+                    if math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
+                        local ap = child.AbsolutePosition
+                        local as = child.AbsoluteSize
+                        updateBox(boxMini, ap.X, ap.Y + inset.Y, as.X, as.Y)
+                        setBoxVisible(boxMini, true)
+                        lblMini.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                        lblMini.Visible = true
+                        miniFound = true
+                        break
+                    end
+                end
+            end
+            if not miniFound then setBoxVisible(boxMini, false); lblMini.Visible = false end
+
+            -- ── Action Button (exact path) ──
+            local actionFound = false
+            for _, lv1 in ipairs(mainUI:GetChildren()) do
+                if lv1:IsA("ImageLabel") then
+                    for _, lv2 in ipairs(lv1:GetChildren()) do
+                        if lv2:IsA("ImageLabel") then
+                            for _, lv3 in ipairs(lv2:GetChildren()) do
+                                if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
+                                    local ap = lv3.AbsolutePosition
+                                    local as = lv3.AbsoluteSize
+                                    updateBox(boxAction, ap.X, ap.Y + inset.Y, as.X, as.Y, 2)
+                                    setBoxVisible(boxAction, true)
+                                    lblAction.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                                    lblAction.Visible = true
+                                    actionFound = true
+
+                                    -- ── Confirm ImageLabel ลูก ──
+                                    local confirmFound = false
+                                    for _, child in ipairs(lv3:GetChildren()) do
+                                        if child:IsA("ImageLabel") and child.Visible and child.AbsoluteSize.X > 0 then
+                                            local cap = child.AbsolutePosition
+                                            local cas = child.AbsoluteSize
+                                            updateBox(boxConfirm, cap.X, cap.Y + inset.Y, cas.X, cas.Y, 2)
+                                            setBoxVisible(boxConfirm, true)
+                                            lblConfirm.Position = UDim2.new(0, cap.X, 0, cap.Y + inset.Y - 16)
+                                            lblConfirm.Visible = true
+                                            confirmFound = true
+                                            break
+                                        end
+                                    end
+                                    if not confirmFound then setBoxVisible(boxConfirm, false); lblConfirm.Visible = false end
+                                    break
+                                end
+                            end
+                        end
+                        if actionFound then break end
+                    end
+                end
+                if actionFound then break end
+            end
+            if not actionFound then
+                setBoxVisible(boxAction, false); lblAction.Visible = false
+                setBoxVisible(boxConfirm, false); lblConfirm.Visible = false
+            end
+        end)
+    end
+end)
+-- ────────────────────────────────────────────────────────────
+
+ = Tabs.Fishing:AddToggle("AutoFishToggle", { Title = "Enable Auto Fish", Default = HubConfig.AutoFish })
 AutoFishToggle:OnChanged(function(Value)
     autoFarmEnabled = Value
     HubConfig.AutoFish = Value
@@ -2228,21 +2424,37 @@ task.spawn(function()
             if child:IsA("GuiObject") and child.Visible then
                 local xOff = child.Size.X.Offset
                 local xScl = child.Size.X.Scale
-
-                -- ตรวจ BackgroundTransparency: 0.4 = active, 1.0 = inactive
-                -- ยอมรับช่วง 0.0–0.6 ว่า "active", > 0.8 ว่า "inactive"
                 local bg = child.BackgroundTransparency
-                local isActive = (bg <= 0.6)
 
+                -- Fish UI: ตรวจ size ปกติ + เพิ่มเช็ค BG == 0.40 (เฉพาะ Fish เท่านั้น)
                 if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
-                    fishOn = isActive
+                    fishOn = math.abs(bg - 0.40) < 0.05
+
+                -- Minigame UI: ตรวจ size + BG active ปกติ
                 elseif math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
-                    miniOn = isActive
-                elseif math.abs(xOff - 250) <= 2 or math.abs(xScl - 0.185) <= 0.005 then
-                    actOn = isActive
+                    miniOn = (bg <= 0.6)
                 end
             end
         end
+
+        -- Action UI: ตรวจจาก exact path แทน size
+        -- MainInterface > ImageLabel > ImageLabel > ImageButton (ต้อง Visible + Position ready)
+        pcall(function()
+            for _, lv1 in ipairs(mainUI:GetChildren()) do
+                if lv1:IsA("ImageLabel") then
+                    for _, lv2 in ipairs(lv1:GetChildren()) do
+                        if lv2:IsA("ImageLabel") then
+                            for _, lv3 in ipairs(lv2:GetChildren()) do
+                                if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
+                                    actOn = true
+                                    return
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
 
         DetectFish_ON = fishOn
         DetectMinigame_ON = miniOn
