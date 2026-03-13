@@ -665,21 +665,47 @@ end
 local function forceFishClick(element)
     if not element then return false end
     local successClicked = false
+
+    -- วิธีที่ 1: ยิง event connections โดยตรง (ดีที่สุดสำหรับมือถือ)
+    pcall(function()
+        local button = element
+        if not button:IsA("GuiButton") and button.Parent and button.Parent:IsA("GuiButton") then
+            button = button.Parent
+        end
+        if getconnections and button:IsA("GuiButton") then
+            local clickConns = getconnections(button.MouseButton1Click)
+            for _, conn in ipairs(clickConns) do pcall(function() conn:Fire() end) end
+            local activatedConns = getconnections(button.Activated)
+            for _, conn in ipairs(activatedConns) do pcall(function() conn:Fire() end) end
+            if (#clickConns > 0 or #activatedConns > 0) then
+                successClicked = true
+            end
+        end
+    end)
+
+    -- วิธีที่ 2: VirtualInputManager Mouse + Touch (รองรับมือถือ)
     pcall(function()
         local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
         if absSize.X > 0 and absSize.Y > 0 then
             local inset, _ = guiService:GetGuiInset()
             local clickX = absPos.X + (absSize.X / 2)
             local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-            
+
             task.spawn(function()
+                -- Mouse click
                 pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
                 task.wait(0.05)
                 pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+                -- Touch event (มือถือ)
+                task.wait(0.02)
+                pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), true) end)
+                task.wait(0.05)
+                pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), false) end)
             end)
             successClicked = true
         end
     end)
+
     return successClicked
 end
 
@@ -756,10 +782,25 @@ local function walkToTarget(targetPos, locationName)
     end
 end
 
-local function isCacheValid(element) return element and element.Parent and element:IsDescendantOf(playerGui) end
+local function isCacheValid(element)
+    if not element then return false end
+    if not element.Parent then return false end
+    if not element:IsDescendantOf(playerGui) then return false end
+    -- ตรวจสอบว่า element ยังมองเห็นอยู่จริง (ป้องกัน cache ค้างเมื่อ UI ซ่อน)
+    local ok, visible = pcall(function() return element.Visible end)
+    if not ok then return false end
+    return true -- ไม่บังคับ visible ตรงนี้ เพราะ getFishButton ตรวจแยก
+end
 
 local function getExtraButton(mainUI)
-    if isCacheValid(cachedExtraBtn) then return cachedExtraBtn end
+    -- ตรวจ cache อย่างเข้มงวด: ต้องยังอยู่ใน DOM และ visible
+    if cachedExtraBtn and cachedExtraBtn.Parent and cachedExtraBtn:IsDescendantOf(playerGui) then
+        local ok, vis = pcall(function() return cachedExtraBtn.Visible end)
+        if ok and vis then return cachedExtraBtn end
+    end
+    cachedExtraBtn = nil -- ล้าง cache เก่า
+
+    -- ค้นหาแบบเดิม (ลึก 4 ชั้น ImageLabel -> ImageButton ที่มี ImageLabel ลูก)
     for _, child1 in ipairs(mainUI:GetChildren()) do
         if child1:IsA("ImageLabel") then
             for _, child2 in ipairs(child1:GetChildren()) do
@@ -768,7 +809,7 @@ local function getExtraButton(mainUI)
                         if child3:IsA("ImageButton") then
                             for _, child4 in ipairs(child3:GetChildren()) do
                                 if child4:IsA("ImageLabel") then
-                                    cachedExtraBtn = child3 
+                                    cachedExtraBtn = child3
                                     return cachedExtraBtn
                                 end
                             end
@@ -778,17 +819,62 @@ local function getExtraButton(mainUI)
             end
         end
     end
+
+    -- FALLBACK สำหรับมือถือ: หา ImageButton ที่ visible และมีขนาดพอเหมาะ
+    -- ที่ไม่ใช่ปุ่ม Fish (ป้องกันชนกัน)
+    for _, desc in ipairs(mainUI:GetDescendants()) do
+        if desc:IsA("ImageButton") and desc.Visible then
+            local sz = desc.AbsoluteSize
+            if sz.X > 40 and sz.X < 200 and sz.Y > 40 and sz.Y < 200 then
+                -- ไม่ใช่ปุ่มที่มี TextLabel "Fish"
+                local hasFishLabel = false
+                for _, c in ipairs(desc:GetDescendants()) do
+                    if c:IsA("TextLabel") and (c.Text == "Fish" or c.Text:lower() == "fish") then
+                        hasFishLabel = true; break
+                    end
+                end
+                if not hasFishLabel then
+                    -- ตรวจว่ามี connection (มือถือ)
+                    if getconnections then
+                        local conns = getconnections(desc.Activated)
+                        if conns and #conns > 0 then
+                            cachedExtraBtn = desc
+                            return cachedExtraBtn
+                        end
+                    else
+                        cachedExtraBtn = desc
+                        return cachedExtraBtn
+                    end
+                end
+            end
+        end
+    end
     return nil
 end
 
 local function getFishButton(mainUI)
-    if isCacheValid(cachedFishBtn) then return cachedFishBtn end
+    -- ตรวจ cache: ถ้า element ยังอยู่ครบและ parent ถูกต้อง ให้ใช้ต่อ
+    if cachedFishBtn and cachedFishBtn.Parent and cachedFishBtn:IsDescendantOf(playerGui) then
+        return cachedFishBtn
+    end
+    cachedFishBtn = nil -- ล้าง cache ที่ตาย
+
+    -- ค้นหาจาก Text "Fish" (ตรงตัว)
     for _, element in ipairs(mainUI:GetDescendants()) do
-        if element:IsA("TextLabel") and element.Text == "Fish" then
-            local parentBtn = element.Parent
-            if parentBtn and (parentBtn:IsA("ImageButton") or parentBtn:IsA("TextButton") or parentBtn:IsA("GuiButton")) then
-                cachedFishBtn = parentBtn 
-                return cachedFishBtn
+        if element:IsA("TextLabel") then
+            local txt = element.Text
+            if txt == "Fish" or txt:lower() == "fish" then
+                local parentBtn = element.Parent
+                if parentBtn and (parentBtn:IsA("ImageButton") or parentBtn:IsA("TextButton") or parentBtn:IsA("GuiButton")) then
+                    cachedFishBtn = parentBtn
+                    return cachedFishBtn
+                end
+                -- กรณีที่ parent ไม่ใช่ button โดยตรง ให้ขึ้นไปอีกชั้น
+                local grandParent = parentBtn and parentBtn.Parent
+                if grandParent and (grandParent:IsA("ImageButton") or grandParent:IsA("TextButton") or grandParent:IsA("GuiButton")) then
+                    cachedFishBtn = grandParent
+                    return cachedFishBtn
+                end
             end
         end
     end
@@ -1072,6 +1158,52 @@ end)
 Tabs.Fishing:AddParagraph({ Title = "⚠️ Important", Content = "Please close the Chat Box before enabling Auto Fish to prevent accidental clicks." })
 local FishStatusLabel = Tabs.Fishing:AddParagraph({ Title = "Status", Content = "Idle" })
 local FishBagLabel = Tabs.Fishing:AddParagraph({ Title = "Fish in Bag", Content = currentFishCount .. " / " .. targetFishCount })
+
+-- ── Debug Detect Panel ──────────────────────────────────────
+local DetectDebugLabel = Tabs.Fishing:AddParagraph({
+    Title = "🔍 Detect Status",
+    Content = "Fish UI: ❓  |  Minigame: ❓  |  Action: ❓"
+})
+
+-- อัปเดต label นี้ทุก 0.3 วิ แสดงค่า BG Transparency + สถานะ ON/OFF
+task.spawn(function()
+    while task.wait(0.3) do
+        if not DetectDebugLabel then continue end
+        pcall(function()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
+            if not mainUI then
+                DetectDebugLabel:SetDesc("MainInterface: ❌ Not Found")
+                return
+            end
+
+            local function getUIInfo(targetXOff, targetXScl)
+                for _, child in ipairs(mainUI:GetChildren()) do
+                    if child:IsA("GuiObject") and child.Visible then
+                        local xOff = child.Size.X.Offset
+                        local xScl = child.Size.X.Scale
+                        if math.abs(xOff - targetXOff) <= 2 or math.abs(xScl - targetXScl) <= 0.005 then
+                            local bg = child.BackgroundTransparency
+                            local active = bg <= 0.6
+                            return string.format("%.2f %s", bg, active and "✅" or "❌")
+                        end
+                    end
+                end
+                return "— (not found)"
+            end
+
+            local fishInfo  = getUIInfo(201, 0.122)
+            local miniInfo  = getUIInfo(230, 0.140)
+            local actInfo   = getUIInfo(250, 0.185)
+
+            DetectDebugLabel:SetDesc(
+                "Fish UI  : " .. fishInfo .. "\n" ..
+                "Minigame : " .. miniInfo .. "\n" ..
+                "Action   : " .. actInfo
+            )
+        end)
+    end
+end)
+-- ────────────────────────────────────────────────────────────
 
 local AutoFishToggle = Tabs.Fishing:AddToggle("AutoFishToggle", { Title = "Enable Auto Fish", Default = HubConfig.AutoFish })
 AutoFishToggle:OnChanged(function(Value)
@@ -2046,23 +2178,27 @@ task.spawn(function()
         end
         
         local fishOn, miniOn, actOn = false, false, false
-        local fUI, mUI, aUI = nil, nil, nil
 
         for _, child in ipairs(mainUI:GetChildren()) do
             if child:IsA("GuiObject") and child.Visible then
                 local xOff = child.Size.X.Offset
                 local xScl = child.Size.X.Scale
-                
+
+                -- ตรวจ BackgroundTransparency: 0.4 = active, 1.0 = inactive
+                -- ยอมรับช่วง 0.0–0.6 ว่า "active", > 0.8 ว่า "inactive"
+                local bg = child.BackgroundTransparency
+                local isActive = (bg <= 0.6)
+
                 if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
-                    fishOn = true; fUI = child
+                    fishOn = isActive
                 elseif math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
-                    miniOn = true; mUI = child
+                    miniOn = isActive
                 elseif math.abs(xOff - 250) <= 2 or math.abs(xScl - 0.185) <= 0.005 then
-                    actOn = true; aUI = child
+                    actOn = isActive
                 end
             end
         end
-        
+
         DetectFish_ON = fishOn
         DetectMinigame_ON = miniOn
         DetectAction_ON = actOn
@@ -2074,6 +2210,8 @@ local function ClearFishingCache()
     cachedDiamond = nil
     cachedExtraBtn = nil
     cachedFishBtn = nil
+    -- reset recovery layers ด้วยเมื่อเคลียร์ cache เต็มรูปแบบ
+    if resetAllRecovery then resetAllRecovery() end
 end
 
 task.spawn(function()
@@ -2091,39 +2229,40 @@ task.spawn(function()
 
         if autoSellEnabled and currentFishCount >= targetFishCount then
             if not isSellingProcess then
-                hasArrivedAtSell = false 
+                hasArrivedAtSell = false
                 print("Bag Full! Initiating Sell...")
+                ClearFishingCache() -- ล้าง cache ทั้งหมดก่อนเริ่ม sell
+                fishingStep = 0
+                hasMinigameMoved = false
                 
+                -- กด Extra Action ถ้ายังค้างอยู่ (ไม่ต้องรอนาน)
                 pcall(function()
                     local mainUI = playerGui:FindFirstChild("MainInterface")
                     if mainUI then
                         local extraBtn = getExtraButton(mainUI)
                         if extraBtn and extraBtn.Visible then
                             if FishStatusLabel then FishStatusLabel:SetDesc("⚙️ Claiming Extra Action...") end
-                            task.wait(2.0) 
                             forceCraftClick(extraBtn)
-                            task.wait(1.5)
+                            task.wait(0.4)
                         end
                     end
                 end)
 
+                -- กดปุ่ม Bag / Inventory เพื่อเปิดหน้าขาย
                 pcall(function()
                     if FishStatusLabel then FishStatusLabel:SetDesc("⚙️ Preparing to Sell...") end
                     local mainUI = playerGui:FindFirstChild("MainInterface")
                     if mainUI then
                         local sideButtons = mainUI:FindFirstChild("SideButtons")
                         if sideButtons then
-                            local waitStart = tick()
-                            local btn1 = nil
-                            while tick() - waitStart < 5 do
-                                local children = sideButtons:GetChildren()
-                                if children[8] then btn1 = children[8] break end
-                                task.wait(0.2)
+                            local children = sideButtons:GetChildren()
+                            if children[8] then
+                                forceCraftClick(children[8])
+                                task.wait(0.5)
                             end
-                            if btn1 then forceCraftClick(btn1) task.wait(1.5) end
                         end
                     end
-                    
+
                     local btn2 = nil
                     local guiChildren = playerGui:GetChildren()
                     if guiChildren[41] then
@@ -2141,7 +2280,7 @@ task.spawn(function()
                             end
                         end
                     end
-                    if btn2 then forceCraftClick(btn2) task.wait(1) end
+                    if btn2 then forceCraftClick(btn2) task.wait(0.4) end
                 end)
                 
                 isSellingProcess = true
@@ -2165,7 +2304,7 @@ task.spawn(function()
             else
                 if not hasArrivedAtSell then
                     if char:FindFirstChild("Humanoid") then char.Humanoid:MoveTo(root.Position) end
-                    task.wait(1)
+                    task.wait(0.3) -- ลดจาก 1.0
 
                     pcall(function()
                         local promptFired = false
@@ -2175,8 +2314,8 @@ task.spawn(function()
                                 if parentPart and parentPart:IsA("BasePart") then
                                     if (parentPart.Position - root.Position).Magnitude <= 15 then
                                         if fireproximityprompt then
-                                            fireproximityprompt(obj, 1) 
-                                            fireproximityprompt(obj, 0) 
+                                            fireproximityprompt(obj, 1)
+                                            fireproximityprompt(obj, 0)
                                             promptFired = true
                                         end
                                     end
@@ -2184,32 +2323,38 @@ task.spawn(function()
                             end
                         end
                         if not promptFired then
-                            task.spawn(function()
-                                for i = 1, 4 do
-                                    vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                                    task.wait(0.2)
-                                    vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-                                    task.wait(0.3)
-                                end
-                            end)
+                            -- ส่ง E key เร็วขึ้น
+                            for i = 1, 3 do
+                                vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                                task.wait(0.1)
+                                vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                                task.wait(0.15)
+                            end
                         end
                     end)
 
-                    task.wait(2)
+                    task.wait(0.8) -- ลดจาก 2.0 รอ dialog โหลด
                     hasArrivedAtSell = true
                 end
                 
                 local hasCompletedSell = false
                 local sellAttemptStart = tick()
-                
+                local sellDialogRetry = 0
+                local MAX_SELL_RETRY = 3
+
                 while not hasCompletedSell and autoFarmEnabled and isSellingProcess do
-                    task.wait(0.2) 
-                    if tick() - sellAttemptStart > 60 then break end
-                    
+                    task.wait(0.15) -- ลดจาก 0.3
+                    if tick() - sellAttemptStart > 45 then -- ลดจาก 75
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Sell timeout! Force exit...") end
+                        break
+                    end
+
                     local mainUI = playerGui:FindFirstChild("MainInterface")
-                    local dialog = mainUI and mainUI:FindFirstChild("Dialog")
+                    if not mainUI then task.wait(0.2); continue end
+                    local dialog = mainUI:FindFirstChild("Dialog")
                 
                     if dialog and dialog.Visible then
+                        sellDialogRetry = 0
                         local choices = dialog:FindFirstChild("Choices")
                         if choices and choices.Visible then
                             local validChoices = {}
@@ -2222,45 +2367,27 @@ task.spawn(function()
                             if #validChoices >= 2 then
                                 forceCraftClick(validChoices[2])
                                 if not mainUI then break end
-                                if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Waiting for Bag to load...") end
-                                task.wait(1.5)
+                                if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Waiting for Bag...") end
+                                task.wait(0.8) -- ลดจาก 1.5
                                 
                                 local emptyBagCheck = 0
                                 while autoFarmEnabled and isSellingProcess do
-                                    sellAttemptStart = tick() 
+                                    sellAttemptStart = tick()
 
+                                    -- หา ScrollingFrame ที่มี item
                                     local scrollFrame = nil
                                     pcall(function()
-                                        for _, f1 in ipairs(mainUI:GetChildren()) do
-                                            if f1.Name == "Frame" and f1.Visible then
-                                                for _, f2 in ipairs(f1:GetChildren()) do
-                                                    if f2.Name == "Frame" and f2.Visible then
-                                                        for _, f3 in ipairs(f2:GetChildren()) do
-                                                            if f3.Name == "Frame" and f3.Visible then
-                                                                local sf = f3:FindFirstChild("ScrollingFrame")
-                                                                if sf and sf.Visible then
-                                                                    scrollFrame = sf
-                                                                    break
-                                                                end
-                                                            end
-                                                        end
-                                                    end
-                                                end
-                                            end
-                                        end
-                                    end)
-                                    
-                                    if not scrollFrame then
+                                        -- fast path: GetDescendants ตรง
                                         for _, desc in ipairs(mainUI:GetDescendants()) do
                                             if desc:IsA("ScrollingFrame") and desc.Visible then
                                                 local hasBtn = false
                                                 for _, c in ipairs(desc:GetChildren()) do
-                                                    if c:IsA("GuiButton") or c:FindFirstChildWhichIsA("GuiButton") then hasBtn = true break end
+                                                    if c:IsA("GuiButton") or c:FindFirstChildWhichIsA("GuiButton") then hasBtn = true; break end
                                                 end
-                                                if hasBtn then scrollFrame = desc break end
+                                                if hasBtn then scrollFrame = desc; break end
                                             end
                                         end
-                                    end
+                                    end)
 
                                     if scrollFrame then
                                         local items = {}
@@ -2272,61 +2399,43 @@ task.spawn(function()
                                         end
                                         
                                         if #items > 0 then
-                                            emptyBagCheck = 0 
+                                            emptyBagCheck = 0
                                             local randomItem = items[math.random(1, #items)]
                                             pcall(function() scrollFrame.CanvasPosition = Vector2.new(0, 0) end)
-                                            task.wait(0.5)
+                                            task.wait(0.2) -- ลดจาก 0.5
                                             
-                                            if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Selecting Random Item...") end
+                                            if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Selecting Item...") end
                                             forceCraftClick(randomItem)
-                                            task.wait(0.5)
-                                            
+                                            task.wait(0.25) -- ลดจาก 0.5
+
+                                            -- หา Sell All button (fast: scan descendants ตรง)
                                             if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Clicking Sell All...") end
                                             local sellAllBtn = nil
                                             pcall(function()
-                                                for _, f1 in ipairs(mainUI:GetChildren()) do
-                                                    if f1.Name == "Frame" and f1.Visible then
-                                                        for _, f2 in ipairs(f1:GetChildren()) do
-                                                            if f2.Name == "Frame" and f2.Visible then
-                                                                for _, child in ipairs(f2:GetChildren()) do
-                                                                    if child:IsA("ImageButton") and child.Visible then
-                                                                        local txtLbl = child:FindFirstChild("TextLabel")
-                                                                        if txtLbl then
-                                                                            local txt = txtLbl.Text:lower()
-                                                                            if txt:match("sell all") then
-                                                                                sellAllBtn = child
-                                                                                break
-                                                                            end
-                                                                        end
-                                                                    end
-                                                                end
+                                                for _, desc in ipairs(mainUI:GetDescendants()) do
+                                                    if desc.Visible then
+                                                        local txt = nil
+                                                        if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                                                            txt = desc.Text:lower()
+                                                        end
+                                                        if txt and txt:match("sell all") then
+                                                            if desc:IsA("GuiButton") then
+                                                                sellAllBtn = desc; break
+                                                            elseif desc.Parent and desc.Parent:IsA("GuiButton") then
+                                                                sellAllBtn = desc.Parent; break
                                                             end
                                                         end
                                                     end
                                                 end
                                             end)
-
-                                            if not sellAllBtn then
-                                                for _, desc in ipairs(mainUI:GetDescendants()) do
-                                                    if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
-                                                        local txt = desc.Text:lower()
-                                                        if (txt:match("sell all")) then
-                                                            sellAllBtn = desc:IsA("GuiButton") and desc or desc.Parent
-                                                            if sellAllBtn:IsA("GuiButton") then break end
-                                                        end
-                                                    end
-                                                end
-                                            end
                                             
-                                            if sellAllBtn then 
-                                                task.wait(1.0)
-                                                forceCraftClick(sellAllBtn) 
-                                                task.wait(1.5)
-                                                
-                                                local isConfirmed = false
+                                            if sellAllBtn then
+                                                task.wait(0.3) -- ลดจาก 1.0
+                                                forceCraftClick(sellAllBtn)
+                                                task.wait(0.6) -- ลดจาก 1.5
+
+                                                -- หา Confirm Sell button
                                                 local targetConfirmBtn = nil
-                                                
-                                                if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Confirming in Popup...") end
                                                 pcall(function()
                                                     for _, desc in ipairs(mainUI:GetDescendants()) do
                                                         if desc:IsA("TextLabel") and desc.Text == "Sell Confirm" and desc.Visible then
@@ -2337,38 +2446,38 @@ task.spawn(function()
                                                                         local button = pDesc.Parent
                                                                         if button and (button:IsA("GuiButton") or button:IsA("ImageButton")) and button.Visible then
                                                                             targetConfirmBtn = button
-                                                                            break 
+                                                                            break
                                                                         end
                                                                     end
                                                                 end
                                                             end
                                                         end
-                                                        if targetConfirmBtn then break end 
+                                                        if targetConfirmBtn then break end
                                                     end
                                                 end)
 
-                                                if targetConfirmBtn then 
-                                                    task.wait(1.0)
-                                                    forceCraftClick(targetConfirmBtn) 
-                                                    task.wait(2.0)
-                                                    isConfirmed = true
+                                                if targetConfirmBtn then
+                                                    task.wait(0.3) -- ลดจาก 1.0
+                                                    forceCraftClick(targetConfirmBtn)
+                                                    task.wait(0.5) -- ลดจาก 2.0
                                                 end
-                                                
-                                                task.wait(1.0)
-                                            else 
-                                                task.wait(0.5)
+
+                                                task.wait(0.3) -- ลดจาก 1.0
+                                            else
+                                                task.wait(0.3)
                                             end
                                         else
                                             emptyBagCheck = emptyBagCheck + 1
                                             if emptyBagCheck >= 3 then break end
-                                            task.wait(0.5)
-                                            continue 
+                                            task.wait(0.3)
+                                            continue
                                         end
                                     else
-                                        task.wait(1.0)
+                                        task.wait(0.5) -- ลดจาก 1.0
                                     end
                                 end
                                 
+                                -- ปิด UI
                                 if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Closing UI...") end
                                 pcall(function()
                                     local targetCloseBtn = nil
@@ -2384,38 +2493,76 @@ task.spawn(function()
                                             end
                                         end
                                     end
-
                                     if not targetCloseBtn then
-                                        local c42 = mainUI:GetChildren()[42]
-                                        if c42 then
-                                            local tl = c42:FindFirstChild("TextLabel")
-                                            if tl then
-                                                local fallbackBtn = tl:FindFirstChild("ImageButton")
-                                                if fallbackBtn and fallbackBtn.Visible then
-                                                    targetCloseBtn = fallbackBtn
+                                        -- fallback: หา ImageButton ที่ใกล้ TextLabel "Close" หรือ "X"
+                                        for _, desc in ipairs(mainUI:GetDescendants()) do
+                                            if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+                                                local t = desc.Text:lower()
+                                                if t == "x" or t == "close" then
+                                                    local b = desc:IsA("GuiButton") and desc or desc.Parent
+                                                    if b and b:IsA("GuiButton") then targetCloseBtn = b; break end
                                                 end
                                             end
                                         end
                                     end
-
                                     if targetCloseBtn then
                                         forceCraftClick(targetCloseBtn)
-                                        task.wait(1.0)
+                                        task.wait(0.4) -- ลดจาก 1.0
                                     end
                                 end)
                                 
                                 hasCompletedSell = true
                                 totalSellCount = totalSellCount + 1
-                                task.wait(1.5) 
+                                task.wait(0.5) -- ลดจาก 1.5
                             elseif #validChoices > 0 then
                                 forceCraftClick(validChoices[#validChoices])
                                 hasCompletedSell = true
                                 totalSellCount = totalSellCount + 1
-                                task.wait(1.5)
+                                task.wait(0.5) -- ลดจาก 1.5
                             end
                         else
                             forceCraftClick(dialog)
-                            task.wait(0.5)
+                            task.wait(0.2) -- ลดจาก 0.5
+                        end
+                    else
+                        -- Dialog ไม่โผล่: retry การกด proximity prompt / E key
+                        sellDialogRetry = sellDialogRetry + 1
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ No Dialog! Retry " .. sellDialogRetry .. "/" .. MAX_SELL_RETRY) end
+
+                        pcall(function()
+                            local char2 = player.Character
+                            local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
+                            if not root2 then return end
+                            local promptFired2 = false
+                            for _, obj in ipairs(Workspace:GetDescendants()) do
+                                if obj:IsA("ProximityPrompt") then
+                                    local pp = obj.Parent
+                                    if pp and pp:IsA("BasePart") and (pp.Position - root2.Position).Magnitude <= 15 then
+                                        if fireproximityprompt then
+                                            fireproximityprompt(obj, 1)
+                                            task.wait(0.05)
+                                            fireproximityprompt(obj, 0)
+                                            promptFired2 = true
+                                        end
+                                    end
+                                end
+                            end
+                            if not promptFired2 then
+                                for i = 1, 3 do
+                                    vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                                    task.wait(0.1)
+                                    vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                                    task.wait(0.15)
+                                end
+                            end
+                        end)
+                        task.wait(0.8) -- ลดจาก 1.5
+
+                        if sellDialogRetry >= MAX_SELL_RETRY then
+                            -- ถ้า retry ครบแล้วยังไม่มี dialog ให้บังคับออก
+                            if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Force exit sell (no dialog)...") end
+                            hasCompletedSell = true
+                            totalSellCount = totalSellCount + 1
                         end
                     end
                 end
@@ -2433,6 +2580,7 @@ task.spawn(function()
                 if FishStatusLabel then FishStatusLabel:SetDesc("✅ Sell Done! Walking back to fish...") end
 
                 ClearFishingCache()
+                task.wait(0.3) -- pause เล็กน้อยก่อน walk กลับ
             end
             
         else
@@ -2531,165 +2679,302 @@ end)
 
 local fishingRoundCount = 0
 local lastFishingStepTime = tick()
-local actionFirstDetected = 0 
+local actionFirstDetected = 0
+-- Recovery layer tracking: ชั้น 1 = warn+retry, ชั้น 2 = re-detect แล้วบังคับผ่าน
+local recoveryLayer = {} -- recoveryLayer[step] = { layer=0|1|2, time=tick() }
+
+local function getRecovery(step)
+    if not recoveryLayer[step] then recoveryLayer[step] = {layer=0, time=0} end
+    return recoveryLayer[step]
+end
+local function resetRecovery(step)
+    recoveryLayer[step] = {layer=0, time=0}
+end
+local function resetAllRecovery()
+    recoveryLayer = {}
+end
 
 task.spawn(function()
     while task.wait(0.2) do
-        if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI then 
+        if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI then
             fishingStep = 0
             hasMinigameMoved = false
             lastFishingStepTime = tick()
             actionFirstDetected = 0
-            continue 
+            resetAllRecovery()
+            continue
         end
-        
+
         if autoSellEnabled and currentFishCount >= targetFishCount then
             fishingStep = 0
             lastFishingStepTime = tick()
-            continue 
+            resetAllRecovery()
+            continue
         end
 
         pcall(function()
             local mainUI = playerGui:FindFirstChild("MainInterface")
             if not mainUI then return end
 
+            -- ล้าง cache ทุกรอบถ้า UI detect flags เปลี่ยน
             local fishBtn = nil
             if DetectFish_ON then
                 fishBtn = getFishButton(mainUI)
             end
 
             local isFishVisible = false
-            if fishBtn and fishBtn.Visible then
-                local textLbl = fishBtn:FindFirstChildWhichIsA("TextLabel")
-                if textLbl and textLbl.Visible then isFishVisible = true end
+            if fishBtn then
+                -- ตรวจทั้ง parent visible ด้วย
+                local ok, vis = pcall(function() return fishBtn.Visible end)
+                if ok and vis then
+                    local textLbl = fishBtn:FindFirstChildWhichIsA("TextLabel")
+                    if textLbl then
+                        local tOk, tVis = pcall(function() return textLbl.Visible end)
+                        isFishVisible = (tOk and tVis)
+                    else
+                        isFishVisible = true -- ไม่มี TextLabel ลูก ให้ถือว่า visible
+                    end
+                end
             end
 
             local timeInStep = tick() - lastFishingStepTime
 
+            -- ===== STEP 0: รอปุ่ม Fish =====
             if fishingStep == 0 then
                 if FishStatusLabel then FishStatusLabel:SetDesc("🎣 Waiting for Fish Button...") end
-                
+                resetRecovery(0)
+
                 if DetectFish_ON and isFishVisible then
-                    hasMinigameMoved = false 
-                    forceFishClick(fishBtn)
-                    fishingStep = 1 
+                    hasMinigameMoved = false
+                    cachedFishBtn = nil -- ล้าง cache ก่อนคลิกเสมอ
+                    task.wait(0.1)
+                    local freshBtn = getFishButton(mainUI)
+                    if freshBtn then forceFishClick(freshBtn) end
+                    fishingStep = 1
                     lastFishingStepTime = tick()
+
                 elseif timeInStep > 5.0 and DetectFish_ON then
-                    -- RECOVERY STEP 0: มี UI แต่ปุ่มค้าง
-                    if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Fish UI Stuck! Recovery forcing click...") end
-                    if fishBtn then forceFishClick(fishBtn) else clickOnce() end
-                    fishingStep = 1
-                    lastFishingStepTime = tick()
+                    -- RECOVERY ชั้น 1: ปุ่มมีแต่ค้าง -> ล้าง cache แล้วคลิกใหม่
+                    local rec = getRecovery(0)
+                    if rec.layer == 0 then
+                        rec.layer = 1; rec.time = tick()
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] Fish Stuck! Clearing cache & retry...") end
+                        cachedFishBtn = nil
+                        local freshBtn = getFishButton(mainUI)
+                        if freshBtn then forceFishClick(freshBtn) else clickOnce() end
+                        lastFishingStepTime = tick()
+                    elseif rec.layer == 1 and tick() - rec.time > 4.0 then
+                        -- RECOVERY ชั้น 2: ยังค้าง -> Re-detect UI จากศูนย์ แล้วบังคับผ่าน
+                        rec.layer = 2; rec.time = tick()
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Re-detecting Fish UI...") end
+                        ClearFishingCache()
+                        task.wait(0.3)
+                        local reDetectedBtn = getFishButton(mainUI)
+                        if reDetectedBtn and reDetectedBtn.Visible then
+                            forceFishClick(reDetectedBtn)
+                        else
+                            clickOnce()
+                        end
+                        fishingStep = 1
+                        resetRecovery(0)
+                        lastFishingStepTime = tick()
+                    end
+
                 elseif timeInStep > 15.0 then
-                    -- ✅ NEW RECOVERY: ไม่มี UI โผล่มาเลย รอนานเกิน 15 วิ
-                    if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ No Fish UI! Recovery skipping to next step...") end
-                    clickOnce()
-                    fishingStep = 1
-                    lastFishingStepTime = tick()
+                    -- ไม่มี UI โผล่เลย
+                    local rec = getRecovery(0)
+                    if rec.layer < 2 then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] No Fish UI! Forcing click...") end
+                        clickOnce()
+                        rec.layer = 1; rec.time = tick()
+                        lastFishingStepTime = tick()
+                    elseif tick() - rec.time > 5.0 then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Forced skip to step 1...") end
+                        clickOnce()
+                        fishingStep = 1
+                        resetRecovery(0)
+                        lastFishingStepTime = tick()
+                    end
                 end
 
+            -- ===== STEP 1: รอ Minigame =====
             elseif fishingStep == 1 then
                 if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Waiting for Minigame...") end
-                
+
                 if DetectMinigame_ON and isMinigameActive and hasMinigameMoved then
-                    fishingStep = 2 
+                    fishingStep = 2
+                    resetRecovery(1)
                     lastFishingStepTime = tick()
                 elseif DetectFish_ON and isFishVisible then
                     fishingStep = 0
+                    resetRecovery(1)
                     lastFishingStepTime = tick()
                 elseif timeInStep > 5.0 and DetectMinigame_ON then
-                    -- RECOVERY STEP 1
-                    if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Minigame Stuck! Recovery skipping to Action...") end
+                    local rec = getRecovery(1)
+                    if rec.layer == 0 then
+                        -- RECOVERY ชั้น 1: click หน้าจอเพื่อเรียก minigame
+                        rec.layer = 1; rec.time = tick()
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] Minigame Stuck! Retry click...") end
+                        clickOnce()
+                        lastFishingStepTime = tick()
+                    elseif rec.layer == 1 and tick() - rec.time > 4.0 then
+                        -- RECOVERY ชั้น 2: ล้าง minigame cache แล้วบังคับข้าม
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Minigame Re-detect, skip to Action...") end
+                        cachedSafeZone = nil; cachedDiamond = nil
+                        fishingStep = 2
+                        resetRecovery(1)
+                        lastFishingStepTime = tick()
+                    end
+                elseif timeInStep > 12.0 then
+                    -- ไม่ได้เปิด DetectMinigame แต่รอนาน
+                    if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] No Minigame detect, skip...") end
                     fishingStep = 2
+                    resetRecovery(1)
                     lastFishingStepTime = tick()
                 end
 
+            -- ===== STEP 2: รอ Minigame จบ =====
             elseif fishingStep == 2 then
                 if not DetectMinigame_ON or not isMinigameActive then
-                    fishingStep = 3 
-                    lastFishingStepTime = tick()
-                    actionFirstDetected = 0 
-                elseif timeInStep > 5.0 then
-                    -- RECOVERY STEP 2
-                    if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Minigame timeout! Recovery skipping to Action...") end
-                    clickOnce()
                     fishingStep = 3
+                    resetRecovery(2)
                     lastFishingStepTime = tick()
                     actionFirstDetected = 0
+                elseif timeInStep > 5.0 then
+                    local rec = getRecovery(2)
+                    if rec.layer == 0 then
+                        rec.layer = 1; rec.time = tick()
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] Minigame timeout! Force click...") end
+                        clickOnce()
+                        lastFishingStepTime = tick()
+                    elseif rec.layer == 1 and tick() - rec.time > 4.0 then
+                        -- RECOVERY ชั้น 2: ล้าง minigame state บังคับไป step 3
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Force end minigame -> Action...") end
+                        cachedSafeZone = nil; cachedDiamond = nil
+                        isMinigameActive = false
+                        clickOnce()
+                        fishingStep = 3
+                        resetRecovery(2)
+                        lastFishingStepTime = tick()
+                        actionFirstDetected = 0
+                    end
                 end
 
+            -- ===== STEP 3: รอปุ่ม Action =====
             elseif fishingStep == 3 then
                 local extraBtn = nil
                 if DetectAction_ON then
                     extraBtn = getExtraButton(mainUI)
                 end
 
-                local isActionVisible = (extraBtn and extraBtn.Visible)
-                
+                -- ตรวจ visible อย่างเข้มงวด
+                local isActionVisible = false
+                if extraBtn then
+                    local ok, vis = pcall(function() return extraBtn.Visible end)
+                    isActionVisible = ok and vis
+                end
+
                 if isActionVisible then
                     if actionFirstDetected == 0 then
                         actionFirstDetected = tick()
                     end
-                    
-                    if tick() - actionFirstDetected >= 2.0 then
+
+                    if tick() - actionFirstDetected >= 1.5 then
                         if FishStatusLabel then FishStatusLabel:SetDesc("⚙️ Clicking Action Button...") end
+                        -- คลิก 2 ครั้งเพื่อให้แน่ใจบนมือถือ
                         forceFishClick(extraBtn)
-                        
+                        task.wait(0.3)
+                        forceFishClick(extraBtn)
+
                         currentFishCount = currentFishCount + 1
-                        fishingRoundCount = fishingRoundCount + 1 
-                        
+                        fishingRoundCount = fishingRoundCount + 1
+
                         if FishBagLabel then FishBagLabel:SetDesc(currentFishCount .. " / " .. targetFishCount) end
-                        
-                        if currentFishCount >= targetFishCount then
-                            ClearFishingCache()
-                            fishingRoundCount = 0
-                        end
-                        
-                        if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Delay 2s (Action -> Fish)...") end
-                        lastFishingStepTime = tick() 
-                        task.wait(2.0)
-                        
-                        fishingStep = 0
-                        hasMinigameMoved = false
-                        lastFishingStepTime = tick()
-                        actionFirstDetected = 0
-                        
-                        if FishStatusLabel then FishStatusLabel:SetDesc("🚶 Resetting Position to fix UI bug...") end
-                        isResettingUI = true 
-                    else
-                        if FishStatusLabel then FishStatusLabel:SetDesc(string.format("⏳ Action found! Wait %.1fs...", 2.0 - (tick() - actionFirstDetected))) end
-                    end
-                else
-                    actionFirstDetected = 0
-                    
-                    if DetectFish_ON and isFishVisible then
-                        fishingStep = 0
-                        hasMinigameMoved = false
-                        lastFishingStepTime = tick()
-                    elseif timeInStep > 5.0 and DetectAction_ON then
-                        -- RECOVERY STEP 3
-                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Action Stuck! Recovery forcing click & counting...") end
-                        
-                        if extraBtn then forceFishClick(extraBtn) else clickOnce() end
-                        
-                        currentFishCount = currentFishCount + 1
-                        fishingRoundCount = fishingRoundCount + 1 
-                        
-                        if FishBagLabel then FishBagLabel:SetDesc(currentFishCount .. " / " .. targetFishCount) end
-                        
+
                         if currentFishCount >= targetFishCount then
                             ClearFishingCache()
                             fishingRoundCount = 0
                         end
 
-                        task.wait(1.0)
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⏳ Delay 2s (Action -> Fish)...") end
+                        task.wait(2.0)
+
                         fishingStep = 0
                         hasMinigameMoved = false
                         lastFishingStepTime = tick()
                         actionFirstDetected = 0
-                        isResettingUI = true 
+                        resetAllRecovery()
+                        cachedExtraBtn = nil -- ล้าง cache action ทุกรอบ
+
+                        if FishStatusLabel then FishStatusLabel:SetDesc("🚶 Resetting Position to fix UI bug...") end
+                        isResettingUI = true
                     else
-                        if FishStatusLabel then FishStatusLabel:SetDesc("🔍 Waiting for Action Button...") end
+                        if FishStatusLabel then FishStatusLabel:SetDesc(string.format("⏳ Action found! Wait %.1fs...", 1.5 - (tick() - actionFirstDetected))) end
+                    end
+                else
+                    actionFirstDetected = 0
+
+                    if DetectFish_ON and isFishVisible then
+                        fishingStep = 0
+                        hasMinigameMoved = false
+                        resetAllRecovery()
+                        lastFishingStepTime = tick()
+                    elseif timeInStep > 5.0 and DetectAction_ON then
+                        local rec = getRecovery(3)
+                        if rec.layer == 0 then
+                            -- RECOVERY ชั้น 1: ล้าง cache แล้วหา Action button ใหม่
+                            rec.layer = 1; rec.time = tick()
+                            if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ [R1] Action not found! Re-detect...") end
+                            cachedExtraBtn = nil
+                            local freshExtra = getExtraButton(mainUI)
+                            if freshExtra and freshExtra.Visible then
+                                forceFishClick(freshExtra)
+                                task.wait(0.3)
+                                forceFishClick(freshExtra)
+                            else
+                                clickOnce()
+                            end
+                            lastFishingStepTime = tick()
+
+                        elseif rec.layer == 1 and tick() - rec.time > 4.0 then
+                            -- RECOVERY ชั้น 2: force นับรอบแล้วรีเซ็ต
+                            if FishStatusLabel then FishStatusLabel:SetDesc("🔄 [R2] Force count & reset round...") end
+                            ClearFishingCache()
+
+                            -- ลองคลิก fallback ก่อนนับ
+                            local fallbackExtra = getExtraButton(mainUI)
+                            if fallbackExtra then
+                                forceFishClick(fallbackExtra)
+                                task.wait(0.5)
+                            else
+                                clickOnce()
+                            end
+
+                            currentFishCount = currentFishCount + 1
+                            fishingRoundCount = fishingRoundCount + 1
+                            if FishBagLabel then FishBagLabel:SetDesc(currentFishCount .. " / " .. targetFishCount) end
+                            if currentFishCount >= targetFishCount then
+                                ClearFishingCache()
+                                fishingRoundCount = 0
+                            end
+
+                            task.wait(1.0)
+                            fishingStep = 0
+                            hasMinigameMoved = false
+                            lastFishingStepTime = tick()
+                            actionFirstDetected = 0
+                            resetAllRecovery()
+                            isResettingUI = true
+                        else
+                            if FishStatusLabel then FishStatusLabel:SetDesc("🔍 Waiting for Action Button...") end
+                        end
+                    elseif timeInStep > 15.0 then
+                        -- หมดเวลาแม้ไม่ได้เปิด DetectAction
+                        if FishStatusLabel then FishStatusLabel:SetDesc("⚠️ Action timeout, reset round...") end
+                        fishingStep = 0
+                        hasMinigameMoved = false
+                        resetAllRecovery()
+                        lastFishingStepTime = tick()
                     end
                 end
             end
