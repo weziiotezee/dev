@@ -12,7 +12,7 @@ local guiService = game:GetService("GuiService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 local PathfindingService = game:GetService("PathfindingService")
-local RunService = game:GetService("RunService")
+-- RunService ถูกลบออกแล้ว เพราะ Heartbeat ถูกเปลี่ยนเป็น task.wait loop
 
 local player = Players.LocalPlayer
 local playerName = player.DisplayName or player.Name
@@ -368,11 +368,13 @@ local function ServerHop()
         if HopStatusLabel then HopStatusLabel:SetDesc("Teleporting to new server...") end
         TeleportService:TeleportToPlaceInstance(placeId, targetServer, player)
     else
-        if HopStatusLabel then HopStatusLabel:SetDesc("Server not found. Retrying...") end
-        visitedServers = {game.JobId} 
+        -- [FIX] เปลี่ยนจาก recursive call เป็น reset แล้วให้ loop ข้างนอกลองใหม่เอง
+        -- ป้องกัน stack overflow กรณี server เต็มทุก round
+        if HopStatusLabel then HopStatusLabel:SetDesc("Server not found. Resetting blocklist...") end
+        visitedServers = {game.JobId}
         task.wait(3)
         isHopping = false
-        ServerHop()
+        -- ไม่เรียก ServerHop() ซ้ำอีก — loop biome scan จะเรียกใหม่เองในรอบถัดไป
     end
 end
 
@@ -623,7 +625,6 @@ end
 
 -- ==========================================
 -- 1. ฟังก์ชันคลิกสำหรับ UI ทั่วไป และ Auto Craft
--- [FIX] เพิ่ม screen bounds guard, ลบ task.spawn (ป้องกัน coroutine stack)
 -- ==========================================
 local function forceCraftClick(element)
     if not element then return false end
@@ -641,35 +642,38 @@ local function forceCraftClick(element)
         end
     end)
 
-    if not successClicked then
-        pcall(function()
-            local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
-            if absSize.X > 0 and absSize.Y > 0 then
-                local inset, _ = guiService:GetGuiInset()
-                local clickX = absPos.X + (absSize.X / 2)
-                local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-                -- [FIX] เช็ค screen bounds ป้องกันคลิกผิด UI
-                local vp = camera.ViewportSize
-                if clickX > 0 and clickY > 0 and clickX < vp.X and clickY < vp.Y then
-                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
-                    task.wait(0.05)
-                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
-                    successClicked = true
-                end
-            end
-        end)
-    end
+    pcall(function()
+        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+        if absSize.X > 0 and absSize.Y > 0 then
+            -- [FIX] ใช้ทั้ง inset.X และ inset.Y (เดิมลืม inset.X ทำให้พิกัดเพี้ยนบนจอกว้าง/มือถือบาง device)
+            local inset, _ = guiService:GetGuiInset()
+            local rawX = absPos.X + (absSize.X / 2) + inset.X
+            local rawY = absPos.Y + (absSize.Y / 2) + inset.Y
+            -- [FIX] Clamp พิกัดให้อยู่ในขอบจอ ป้องกันไปโดน UI อื่น
+            local vp = camera.ViewportSize
+            local margin = 2
+            local clickX = math.clamp(rawX, margin, vp.X - margin)
+            local clickY = math.clamp(rawY, margin, vp.Y - margin)
+
+            task.spawn(function()
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                task.wait(0.05)
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+            end)
+            successClicked = true
+        end
+    end)
     
     return successClicked
 end
 
 -- ==========================================
 -- 2. ฟังก์ชันคลิกเฉพาะหน้าจอ / ปุ่มสำหรับการตกปลา
--- [FIX] ลบ SendTouchEvent ซ้อน (ทำให้คลิกโดน UI 2 ครั้ง)
--- [FIX] ลบ task.spawn (ป้องกัน coroutine stack up)
--- [FIX] เพิ่ม screen bounds guard (ป้องกันคลิกนอกจอ)
--- [FIX] fire connection ก่อน ถ้าสำเร็จแล้วไม่ต้อง SendMouseEvent
 -- ==========================================
+-- [FIX] ตรวจสอบว่าเป็น Touch device จริงไหม ก่อนส่ง TouchEvent
+-- ป้องกันกรณีที่คอมพิวเตอร์ส่ง TouchEvent ซ้อน MouseEvent แล้วไปโดน UI อื่น
+local isTouchDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
 local function forceFishClick(element)
     if not element then return false end
     local successClicked = false
@@ -681,41 +685,53 @@ local function forceFishClick(element)
         end
         if getconnections and button:IsA("GuiButton") then
             local clickConns = getconnections(button.MouseButton1Click)
-            local activatedConns = getconnections(button.Activated)
             for _, conn in ipairs(clickConns) do pcall(function() conn:Fire() end) end
+            local activatedConns = getconnections(button.Activated)
             for _, conn in ipairs(activatedConns) do pcall(function() conn:Fire() end) end
-            if #clickConns > 0 or #activatedConns > 0 then
+            if (#clickConns > 0 or #activatedConns > 0) then
                 successClicked = true
             end
         end
     end)
 
-    -- ส่ง mouse event เฉพาะเมื่อ connection ไม่สำเร็จ หรือเพิ่มเติม
-    if not successClicked then
-        pcall(function()
-            local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
-            if absSize.X > 0 and absSize.Y > 0 then
-                local inset, _ = guiService:GetGuiInset()
-                local clickX = absPos.X + (absSize.X / 2)
-                local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-                -- [FIX] เช็ค screen bounds ป้องกันคลิกผิด UI
-                local vp = camera.ViewportSize
-                if clickX > 0 and clickY > 0 and clickX < vp.X and clickY < vp.Y then
-                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+    pcall(function()
+        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+        if absSize.X > 0 and absSize.Y > 0 then
+            -- [FIX] ใช้ทั้ง inset.X และ inset.Y + Clamp พิกัดให้อยู่ในขอบจอ
+            local inset, _ = guiService:GetGuiInset()
+            local rawX = absPos.X + (absSize.X / 2) + inset.X
+            local rawY = absPos.Y + (absSize.Y / 2) + inset.Y
+            local vp = camera.ViewportSize
+            local margin = 2
+            local clickX = math.clamp(rawX, margin, vp.X - margin)
+            local clickY = math.clamp(rawY, margin, vp.Y - margin)
+
+            task.spawn(function()
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                task.wait(0.05)
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+                -- [FIX] ส่ง TouchEvent เฉพาะ Touch device จริงๆ เท่านั้น
+                -- บนคอมพิวเตอร์การส่ง TouchEvent ซ้อนกันทำให้ไปโดน UI อื่น
+                if isTouchDevice then
+                    task.wait(0.02)
+                    pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), true) end)
                     task.wait(0.05)
-                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
-                    successClicked = true
+                    pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), false) end)
                 end
-            end
-        end)
-    end
+            end)
+            successClicked = true
+        end
+    end)
 
     return successClicked
 end
 
 local function clickOnce()
     task.spawn(function()
-        local safeX, safeY = camera.ViewportSize.X * 0.5, camera.ViewportSize.Y * 0.5
+        -- [FIX] ใช้ inset ให้ถูกต้องใน clickOnce ด้วย
+        local inset, _ = guiService:GetGuiInset()
+        local safeX = camera.ViewportSize.X * 0.5 + inset.X
+        local safeY = camera.ViewportSize.Y * 0.5 + inset.Y
         pcall(function() vim:SendMouseButtonEvent(safeX, safeY, 0, true, game, 1) end)
         task.wait(0.05) 
         pcall(function() vim:SendMouseButtonEvent(safeX, safeY, 0, false, game, 1) end)
@@ -1125,10 +1141,11 @@ _G.MultiCraftDropdown = Tabs.Craft:AddDropdown("MultiCraftDropdown", {
 })
 
 _G.MultiCraftDropdown:OnChanged(function(Value)
-    ScannedItemPaths = {}
-    ScannedItemBaseNames = {}
-    CachedTargetButtons = {} 
-    
+    -- [FIX] ไม่ล้าง ScannedItemPaths / ScannedItemBaseNames ที่นี่
+    -- เพราะทำให้ Craft loop หาปุ่มไม่เจอ โดยเฉพาะ Item ที่มีชื่อซ้ำ (เช่น Gear (2))
+    -- ล้างแค่ CachedTargetButtons ที่เป็น positional cache เท่านั้น
+    CachedTargetButtons = {}
+
     SelectedMultiItems = {}
     local count = 0
     for k, v in pairs(Value) do
@@ -1187,14 +1204,9 @@ end)
 task.spawn(function()
     while task.wait(0.3) do
         if not DetectDebugLabel then continue end
-        
-        if not showDetectOverlay then
-            pcall(function()
-                DetectDebugLabel:SetTitle("🔍 Real-Time UI Diagnostics")
-                DetectDebugLabel:SetDesc("Diagnostics hidden. Enable 'Show Detect Overlay' to view real-time data.")
-            end)
-            continue
-        end
+
+        -- [FIX] ถ้า overlay ปิด ไม่ต้องเขียน UI เลย ข้ามไปได้เลย
+        if not showDetectOverlay then continue end
 
         pcall(function()
             local mainUI = playerGui:FindFirstChild("MainInterface")
@@ -1352,16 +1364,24 @@ local lblConfirm = makeLabel("Confirm",  Color3.fromRGB(255,  80,  80))
 
 local inset = guiService:GetGuiInset()
 
+-- [FIX] ช้าลงจาก 0.1s → 0.25s ลด CPU ลงครึ่งนึง
+-- และ skip งานทั้งหมดทันทีถ้า overlay ปิด (เดิมยังวน loop hide ทุก 0.1s อยู่)
 task.spawn(function()
-    while task.wait(0.1) do
+    local overlayWasVisible = false
+    while task.wait(0.25) do
         if not showDetectOverlay then
-            setBoxVisible(boxFish, false)
-            setBoxVisible(boxMini, false)
-            setBoxVisible(boxAction, false)
-            setBoxVisible(boxConfirm, false)
-            lblFish.Visible, lblMini.Visible, lblAction.Visible, lblConfirm.Visible = false, false, false, false
+            -- ซ่อนครั้งเดียวพอ ไม่ต้อง set ทุก 0.25s
+            if overlayWasVisible then
+                overlayWasVisible = false
+                setBoxVisible(boxFish, false)
+                setBoxVisible(boxMini, false)
+                setBoxVisible(boxAction, false)
+                setBoxVisible(boxConfirm, false)
+                lblFish.Visible, lblMini.Visible, lblAction.Visible, lblConfirm.Visible = false, false, false, false
+            end
             continue
         end
+        overlayWasVisible = true
 
         pcall(function()
             local mainUI = playerGui:FindFirstChild("MainInterface")
@@ -2424,18 +2444,12 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    local lastDetectTick = tick()
-    while task.wait(0.4) do
+    -- [FIX] 0.4s → 0.5s ลด loop frequency ลงเล็กน้อย
+    while task.wait(0.5) do
         if not autoFarmEnabled then
+            DetectFish_ON, DetectMinigame_ON, DetectAction_ON = false, false, false
             continue
         end
-
-        local now = tick()
-        if now - lastDetectTick > 2.0 then
-            lastDetectTick = now
-            continue
-        end
-        lastDetectTick = now
 
         local mainUI = playerGui:FindFirstChild("MainInterface")
         if not mainUI then
@@ -3030,17 +3044,59 @@ task.spawn(function()
                 fishingRoundCount = 0
 
                 if FishBagLabel then FishBagLabel:SetDesc("Rounds: " .. fishingRoundCount .. " / " .. targetFishCount) end
-                if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Returning to Fish...") end
+                if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Closing Dialog...") end
 
-                -- [ADD] กด Choice[3] กันบัค Dialog ค้างก่อนเดินกลับ
-                pcall(function()
-                    local choices = game:GetService("Players").LocalPlayer.PlayerGui.MainInterface.Dialog.Choices
-                    local choiceList = choices:GetChildren()
-                    if choiceList[3] then
-                        forceCraftClick(choiceList[3])
-                    end
-                end)
-                task.wait(0.3)
+                -- [FIX] ปิด Dialog อย่างถูกต้อง แทนการกด choiceList[3] แบบ hardcode
+                -- เดิม: choiceList[3] อาจ nil หรือไม่ใช่ปุ่มปิด ทำให้ Dialog ค้างแล้วไปโดนตอนกด Fish
+                local function closeDialogSafely()
+                    local mainUI = playerGui:FindFirstChild("MainInterface")
+                    if not mainUI then return end
+
+                    -- ลอง 1: กดปุ่ม Close/X ใน Dialog โดยตรง
+                    pcall(function()
+                        local dlg = mainUI:FindFirstChild("Dialog")
+                        if dlg and dlg.Visible then
+                            for _, desc in ipairs(dlg:GetDescendants()) do
+                                if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+                                    local t = desc.Text:lower():gsub("%s+","")
+                                    if t == "x" or t == "close" or t == "ปิด" then
+                                        local btn = desc:IsA("GuiButton") and desc or desc.Parent
+                                        if btn and btn:IsA("GuiButton") then
+                                            forceCraftClick(btn)
+                                            return
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                    task.wait(0.3)
+
+                    -- ลอง 2: กด ESC เพื่อปิด Dialog
+                    pcall(function()
+                        local dlg = mainUI:FindFirstChild("Dialog")
+                        if dlg and dlg.Visible then
+                            vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
+                            task.wait(0.1)
+                            vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
+                        end
+                    end)
+                    task.wait(0.3)
+                end
+
+                closeDialogSafely()
+
+                -- [FIX] รอให้ Dialog หายจริงๆ ก่อนเดินกลับ (timeout 3 วินาที)
+                -- ถ้าไม่รอ ตอนถึง fishing spot แล้วกด Fish button ไปโดน Dialog แทน
+                local dialogWaitStart = tick()
+                while tick() - dialogWaitStart < 3 do
+                    local mainUI = playerGui:FindFirstChild("MainInterface")
+                    local dlg = mainUI and mainUI:FindFirstChild("Dialog")
+                    if not dlg or not dlg.Visible then break end
+                    -- Dialog ยังอยู่ ลองปิดอีกครั้ง
+                    closeDialogSafely()
+                    task.wait(0.3)
+                end
 
                 ClearFishingCache()
                 task.wait(0.3)
@@ -3090,63 +3146,71 @@ local CLICK_RATE_FAR  = 0.05
 local CLICK_RATE_MID  = 0.07
 local CLICK_RATE_NEAR = 0.12
 
--- [FIX] เปลี่ยน RunService.Heartbeat → task loop 0.05s
--- Heartbeat รันทุก frame (60fps) ทำ GetDescendants ตลอดคืน = แลค
--- task.wait(0.05) = 20fps เพียงพอสำหรับ minigame และประหยัด CPU มาก
-task.spawn(function()
-    while task.wait(0.05) do
-        if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI or not DetectMinigame_ON then
-            if isMinigameActive then
-                isMinigameActive = false
-            end
-            continue
+-- [FIX] Status label cache — เขียน UI เฉพาะตอนข้อความเปลี่ยน
+-- บนมือถือ UI property write แพงมาก เขียนทุก frame FPS ตกหนัก
+local _lastFishStatus = ""
+local function setFishStatus(txt)
+    if txt ~= _lastFishStatus then
+        _lastFishStatus = txt
+        if FishStatusLabel then pcall(function() FishStatusLabel:SetDesc(txt) end) end
+    end
+end
+
+-- [FIX] เปลี่ยน Heartbeat → task.wait(0.05) loop
+-- Heartbeat ยิง 60 ครั้ง/วินาที, scan UI + GetDescendants ทุก frame ทำให้มือถือ FPS ตก
+-- 0.05s = 20 ครั้ง/วินาที เร็วพอสำหรับ minigame แต่ไม่กิน CPU มากเกิน
+task.spawn(function() while task.wait(0.05) do
+    if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI or not DetectMinigame_ON then
+        if isMinigameActive then
+            isMinigameActive = false
         end
+        continue  -- [FIX] ใช้ continue แทน return เพราะอยู่ใน while loop
+    end
 
-        pcall(function()
-            local safeZoneBar, diamondIcon = getExactMinigameElements()
+    pcall(function()
+        local safeZoneBar, diamondIcon = getExactMinigameElements()
 
-            if safeZoneBar and safeZoneBar.Visible then
-                isMinigameActive = true
-                hasMinigameMoved = true
+        if safeZoneBar and safeZoneBar.Visible then
+            isMinigameActive = true
+            hasMinigameMoved = true
 
-                if diamondIcon and diamondIcon.Visible then
-                    local overlapping = isOverlapping(diamondIcon, safeZoneBar)
-                    local distance = math.abs((diamondIcon.AbsolutePosition.X + diamondIcon.AbsoluteSize.X / 2) - (safeZoneBar.AbsolutePosition.X + safeZoneBar.AbsoluteSize.X / 2))
-                    local currentTime = tick()
+            if diamondIcon and diamondIcon.Visible then
+                local overlapping = isOverlapping(diamondIcon, safeZoneBar)
+                local distance = math.abs((diamondIcon.AbsolutePosition.X + diamondIcon.AbsoluteSize.X / 2) - (safeZoneBar.AbsolutePosition.X + safeZoneBar.AbsoluteSize.X / 2))
+                local currentTime = tick()
 
-                    if overlapping then
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Target Locked") end
-                    elseif distance > FAR_THRESHOLD then
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Far (Spamming)") end
-                        if currentTime - lastClickTime > CLICK_RATE_FAR then
-                            clickOnce()
-                            lastClickTime = currentTime
-                        end
-                    elseif distance > MID_THRESHOLD then
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Medium") end
-                        if currentTime - lastClickTime > CLICK_RATE_MID then
-                            clickOnce()
-                            lastClickTime = currentTime
-                        end
-                    else
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Near") end
-                        if currentTime - lastClickTime > CLICK_RATE_NEAR then
-                            clickOnce()
-                            lastClickTime = currentTime
-                        end
+                if overlapping then
+                    setFishStatus("Target Locked")
+                elseif distance > FAR_THRESHOLD then
+                    setFishStatus("Distance: Far (Spamming)")
+                    if currentTime - lastClickTime > CLICK_RATE_FAR then
+                        clickOnce()
+                        lastClickTime = currentTime
+                    end
+                elseif distance > MID_THRESHOLD then
+                    setFishStatus("Distance: Medium")
+                    if currentTime - lastClickTime > CLICK_RATE_MID then
+                        clickOnce()
+                        lastClickTime = currentTime
                     end
                 else
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Minigame...") end
+                    setFishStatus("Distance: Near")
+                    if currentTime - lastClickTime > CLICK_RATE_NEAR then
+                        clickOnce()
+                        lastClickTime = currentTime
+                    end
                 end
             else
-                if isMinigameActive then
-                    isMinigameActive = false
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Fish...") end
-                end
+                setFishStatus("Waiting for Minigame...")
             end
-        end)
-    end
-end)
+        else
+            if isMinigameActive then
+                isMinigameActive = false
+                setFishStatus("Waiting for Fish...")
+            end
+        end
+    end)
+end end)
 
 local lastFishingStepTime = tick()
 local actionFirstDetected = 0
@@ -3243,6 +3307,43 @@ task.spawn(function()
             -- ===== STEP 0: รอปุ่ม Fish =====
             if fishingStep == 0 then
                 resetRecovery(0)
+
+                -- [FIX] ตรวจ Dialog NPC ค้างก่อนทุกอย่าง
+                -- ปัญหา: หลัง sell เสร็จ Dialog อาจยังค้างอยู่
+                -- ถ้ากด Fish button ในขณะที่ Dialog เปิดอยู่ จะไปโดน Dialog แทน
+                pcall(function()
+                    local dlg = mainUI:FindFirstChild("Dialog")
+                    if dlg and dlg.Visible then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Closing Dialog before Fish...") end
+                        -- ลอง 1: หาปุ่ม Close/X ใน Dialog
+                        local closed = false
+                        for _, desc in ipairs(dlg:GetDescendants()) do
+                            if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
+                                local t = desc.Text:lower():gsub("%s+","")
+                                if t == "x" or t == "close" or t == "ปิด" then
+                                    local btn = desc:IsA("GuiButton") and desc or desc.Parent
+                                    if btn and btn:IsA("GuiButton") then
+                                        forceCraftClick(btn)
+                                        closed = true
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if not closed then
+                            -- ลอง 2: กด ESC
+                            vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
+                            task.wait(0.1)
+                            vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
+                        end
+                        task.wait(0.4)
+                        -- ถ้า Dialog ยังอยู่ ให้ step reset รอรอบถัดไป
+                        if dlg.Visible then
+                            lastFishingStepTime = tick()
+                            return
+                        end
+                    end
+                end)
 
                 if DetectFish_ON and isFishVisible then
                     if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Fish Button...") end
@@ -3406,15 +3507,30 @@ task.spawn(function()
                         isPositionReady = xScaleOK and xOffOK and yOK
                     end)
 
-                    if isPositionReady then
+                    -- [FIX] เพิ่ม isActionAnimDone ในเงื่อนไข ป้องกันกดปุ่มก่อน Animation เสร็จ
+                    if isPositionReady and isActionAnimDone then
                         if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Action...") end
 
-                        -- [FIX] ลบ parallel actionClickActive loop ออก
-                        -- เหตุผล: loop ซ้อนกับ main loop ทำให้กด 2 ครั้งพร้อมกัน
-                        -- โดน UI อื่น และ spawn coroutine ค้างถ้า actionClickActive ไม่ถูก clear
-                        -- ใช้แค่ main loop เดิมที่จำกัด attempt เพียงพอแล้ว
+                        -- [ADD] Parallel loop: กดทุก 1 วินาที กันแลค/กดพลาด
+                        local actionClickActive = true
+                        task.spawn(function()
+                            while actionClickActive do
+                                pcall(function()
+                                    local pos = extraBtn.Position
+                                    local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
+                                    local xOffOK   = math.abs(pos.X.Offset)    < 5
+                                    local yOK      = math.abs(pos.Y.Scale)      < 0.05
+                                                  and math.abs(pos.Y.Offset)    < 5
+                                    local inPos = xScaleOK and xOffOK and yOK and extraBtn.Visible
+                                    if inPos then
+                                        forceFishClick(extraBtn)
+                                    end
+                                end)
+                                task.wait(1.0)
+                            end
+                        end)
 
-                        -- ระบบเดิม: กดแบบ loop จำกัด attempt
+                        -- ระบบเดิม: กดแบบ loop จำกัด attempt (ยังคงอยู่)
                         local maxAttempts = 10
                         for i = 1, maxAttempts do
                             local stillReady = false
@@ -3436,6 +3552,9 @@ task.spawn(function()
                             if FishStatusLabel then FishStatusLabel:SetDesc(string.format("Clicking Action... (%d/%d)", i, maxAttempts)) end
                             task.wait(0.5)
                         end
+
+                        -- หยุด parallel loop เมื่อ main loop จบ
+                        actionClickActive = false
 
                         task.wait(0.5)
                         local confirmBtn = nil
@@ -3504,6 +3623,8 @@ task.spawn(function()
                         elseif rec.layer == 1 and tick() - rec.time > 4.0 then
                             if FishStatusLabel then FishStatusLabel:SetDesc("Skipping Action Step...") end
                             ClearFishingCache()
+                            -- [FIX] ล้าง actionBGSample ตอน skip ด้วย ป้องกัน memory accumulate
+                            if _G._actionBGSample then _G._actionBGSample = {} end
                             local fallbackExtra = getExtraButton(mainUI)
                             if fallbackExtra then forceFishClick(fallbackExtra)
                             else clickOnce() end
