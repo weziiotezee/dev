@@ -39,32 +39,6 @@ end)
 local TextChatService
 pcall(function() TextChatService = game:GetService("TextChatService") end)
 
--- [PERF] Cache GuiInset — ค่านี้แทบไม่เปลี่ยน เรียกทุก click (20-60x/วินาที) ทำให้แลค
--- รีเฟรชทุก 5 วินาทีเผื่อเปลี่ยน layout (เช่น rotate มือถือ)
-local _cachedInset = guiService:GetGuiInset()
-local _insetRefreshTime = tick()
-local function getCachedInset()
-    if tick() - _insetRefreshTime > 5 then
-        _cachedInset = guiService:GetGuiInset()
-        _insetRefreshTime = tick()
-    end
-    return _cachedInset
-end
-
--- [PERF] ใช้ local table แทน _G._actionBGSample เพราะ _G access ช้ากว่า upvalue
-local _actionBGSample = {}
-
--- [PERF] Cache mainUI — FindFirstChild ทุก 0.3 วินาทีไม่จำเป็น
--- ต้องนิยามก่อนทุก function ที่ใช้ getCachedMainUI()
-local _cachedMainUI = nil
-local function getCachedMainUI()
-    if _cachedMainUI and _cachedMainUI.Parent then
-        return _cachedMainUI
-    end
-    _cachedMainUI = playerGui:FindFirstChild("MainInterface")
-    return _cachedMainUI
-end
-
 -- [FIX] httpRequest: ห่อด้วย pcall กัน error ตอน assign ถ้า executor ไม่มี request บางตัว
 local httpRequest = nil
 pcall(function()
@@ -293,24 +267,34 @@ local function ProcessWebhookQueue()
 end
 
 task.spawn(function()
-    -- [PERF] เพิ่ม 300s — รอบ 180s เดิมทำให้ต้อง re-scan recipe/craft ทุก 3 นาที
-    -- ScannedItemPaths เคลียร์เองเมื่อ scan ใหม่ ไม่ต้องล้างบ่อย
-    while task.wait(300) do
-        -- เคลียร์เฉพาะ scan cache ขนาดใหญ่ที่โต unbounded
-        if #ScannedItemsList > 100 then
-            ScannedItemPaths = {}
-            ScannedItemBaseNames = {}
-            ScannedItemsList = {}
-        end
-        if #CachedTargetButtons > 20 then CachedTargetButtons = {} end
-        -- cachedButtons และ cachedRecipeHolder เคลียร์เองเมื่อ parent nil
-        -- ไม่ต้อง wipe ที่นี่ — ถ้า wipe จะ force rescan ทุก 5 นาที
+    while task.wait(180) do
+        ScannedItemPaths = {}
+        ScannedItemBaseNames = {}
+        CachedTargetButtons = {}
+        cachedButtons = { open = nil, auto = nil, craft = nil }
+        cachedRecipeHolder = nil
 
         if #AuraQueue > 50 then AuraQueue = {} end
         if #ApiQueue > 10 then ApiQueue = {} end
         if #WebhookQueue > 10 then WebhookQueue = {} end
+
+        -- [FIX] reset Cache refs ทุก 3 นาที
+        -- Cache.RollsObj/LuckUI/AuraObj อาจ point ไปหา object ที่ถูกทำลายไปแล้ว
+        -- ถ้าไม่ reset จะทำให้ GetPlayerLuck() วน GetDescendants ทุกครั้งเพราะ Parent = nil
+        Cache.RollsObj = nil
+        Cache.LuckObj = nil
+        Cache.LuckUI = nil
+        Cache.AuraObj = nil
+
+        -- [FIX] reset _actionBGSample ป้องกัน key เก่าค้าง
+        _G._actionBGSample = nil
         
-        if #NPCHistoryList > 10 then 
+        -- [OPT] reset shared caches ป้องกัน stale reference สะสม
+        _cachedActionBtn = nil
+        _cachedActionContainer = nil
+        _cachedPopupRoot = nil
+
+        if #NPCHistoryList > 10 then
             local newList = {}
             for i = 1, 10 do table.insert(newList, NPCHistoryList[i]) end
             NPCHistoryList = newList
@@ -457,7 +441,7 @@ local function SendMerchantWebhook(entityName, isTestMessage, isDespawn)
                 {name = "NPC Name", value = "```" .. entityName .. "```", inline = true},
                 {name = "Current Biome", value = "```" .. CurrentBiomeCache .. "```", inline = false}
             },
-            footer = {text = "XT-HUB [1.3]"}
+            footer = {text = "XT-HUB [1.7]"}
         }}
     }
     
@@ -481,7 +465,7 @@ local function SendBiomeWebhook(biomeName)
                 {name = "Biome", value = "```" .. biomeName .. "```", inline = true},
                 {name = "Server", value = "```" .. tostring(game.JobId):sub(1,8) .. "...```", inline = false}
             },
-            footer = {text = "XT-HUB [1.3]"}
+            footer = {text = "XT-HUB [1.7]"}
         }}
     }
     table.insert(WebhookQueue, {Url = targetData.Url, Body = payload})
@@ -517,9 +501,11 @@ end
 function GetPlayerLuck()
     if Cache.LuckObj and Cache.LuckObj.Parent then return Cache.LuckObj.Value end
     if Cache.LuckAttr then return player:GetAttribute(Cache.LuckAttr) or 1.00 end
-    if Cache.LuckUI and Cache.LuckUI.Parent then
+    -- [FIX] ตรวจ LuckUI ว่า parent ยังอยู่และ text ยังมีตัวเลขก่อน ไม่งั้นจะ scan ใหม่ทั้งหมด
+    if Cache.LuckUI and Cache.LuckUI.Parent and Cache.LuckUI:IsDescendantOf(playerGui) then
         local match = Cache.LuckUI.Text:match("%d+%.?%d*")
-        return match and tonumber(match) or 1.00
+        if match then return tonumber(match) or 1.00 end
+        Cache.LuckUI = nil  -- stale, reset
     end
     local totalLuck = 1.00
     pcall(function()
@@ -533,13 +519,15 @@ function GetPlayerLuck()
         end
         if player:GetAttribute("Luck") then Cache.LuckAttr = "Luck"; totalLuck = player:GetAttribute("Luck"); return end
         if player:GetAttribute("LuckMultiplier") then Cache.LuckAttr = "LuckMultiplier"; totalLuck = player:GetAttribute("LuckMultiplier"); return end
-        -- [PERF] scan mainUI เท่านั้น (เล็กกว่า playerGui 10x)
-        local _mUI = getCachedMainUI() or playerGui
-        for _, gui in ipairs(_mUI:GetDescendants()) do
-            if gui:IsA("TextLabel") then
-                if gui.Name:lower():find("luck") or gui.Text:lower():find("luck:") then
-                    local match = gui.Text:match("%d+%.?%d*")
-                    if match and tonumber(match) then Cache.LuckUI = gui; totalLuck = tonumber(match); return end
+        -- [OPT] Scan เฉพาะ MainInterface แทน playerGui ทั้งหมด — ลด scope 80%+
+        local mainLuckUI = playerGui:FindFirstChild("MainInterface")
+        if mainLuckUI then
+            for _, gui in ipairs(mainLuckUI:GetDescendants()) do
+                if gui:IsA("TextLabel") then
+                    if gui.Name:lower():find("luck") or gui.Text:lower():find("luck:") then
+                        local match = gui.Text:match("%d+%.?%d*")
+                        if match and tonumber(match) then Cache.LuckUI = gui; totalLuck = tonumber(match); return end
+                    end
                 end
             end
         end
@@ -555,15 +543,9 @@ function GetEquippedAura()
         for name, val in pairs(player:GetAttributes()) do
             if name:lower():find("aura") then Cache.AuraAttr = name; currentAura = val; return end
         end
-        -- [PERF] player:GetDescendants() แพง ใช้ depth 2 แทน
-        for _, child in ipairs(player:GetChildren()) do
-            if child:IsA("StringValue") and child.Name:lower():find("aura") and child.Value ~= "" then
-                Cache.AuraObj = child; currentAura = child.Value; return
-            end
-            for _, grand in ipairs(child:GetChildren()) do
-                if grand:IsA("StringValue") and grand.Name:lower():find("aura") and grand.Value ~= "" then
-                    Cache.AuraObj = grand; currentAura = grand.Value; return
-                end
+        for _, v in pairs(player:GetDescendants()) do
+            if v:IsA("StringValue") and v.Name:lower():find("aura") and v.Value ~= "" then
+                Cache.AuraObj = v; currentAura = v.Value; return
             end
         end
     end)
@@ -627,7 +609,7 @@ function ScanPotions()
 end
 
 local function GetInventoryContainer()
-    local mainUI = getCachedMainUI()
+    local mainUI = playerGui:FindFirstChild("MainInterface")
     if mainUI then
         local invUI = mainUI:FindFirstChild("Inventory")
         if invUI and invUI:FindFirstChild("Items") and invUI.Items:FindFirstChild("ItemGrid") then
@@ -647,7 +629,7 @@ function ScanGear()
                     local itemName, itemCount = ParseInventoryEntry(entry)
                     if itemName then AddInventoryItem(gearItems, itemName, itemCount) end
                 end
-                if i % 10 == 0 then task.wait() end 
+                if i % 50 == 0 then task.wait() end 
             end
         end
     end)
@@ -655,47 +637,29 @@ function ScanGear()
 end
 
 function GetAuraTableData()
-    local mainUI = getCachedMainUI()
+    local mainUI = playerGui:FindFirstChild("MainInterface")
     if not mainUI then return nil end
     local auraDataDict = {}
     local totalUniqueAuras = 0
     
-    -- [PERF] หา aura collection container ก่อน แล้ว scan แค่ subtree ของมัน
-    -- แทนที่จะ GetDescendants() ทั้ง MainInterface ซึ่งมีพัน object
-    local auraRoot = nil
-    pcall(function()
-        -- aura collection มักอยู่ใน UI ที่ชื่อ "Auras", "Collection", "AuraCollection"
-        for _, child in ipairs(mainUI:GetChildren()) do
-            local n = child.Name:lower()
-            if n:find("aura") or n:find("collection") then
-                auraRoot = child
-                break
-            end
-        end
-    end)
-    -- fallback: scan ทั้งหมด แต่ทำ yield ทุก 25 object ป้องกัน stall
-    local searchRoot = auraRoot or mainUI
-
+    -- [OPT] yield ทุก 100 items แทน 25 — ลด overhead จาก task.wait() ที่ยิง 4x ต่อ 100 items
     local count = 0
-    for _, obj in ipairs(searchRoot:GetDescendants()) do
-        if obj:IsA("TextLabel") and obj.Name == "TextLabel" then
-            if obj.Parent then
-                local parentName = obj.Parent.Name
-                if string.match(parentName, "^0%.%d+$") then
-                    local auraText = obj.Text
-                    local isMultiplierText = string.match(auraText:lower():gsub("%s+", ""), "^x%d+$")
-                    if auraText ~= "" and auraText ~= "Undefined" and not isMultiplierText then
-                        local uiLayoutOrder = 0
-                        pcall(function() uiLayoutOrder = obj.Parent.LayoutOrder end)
-                        if not auraDataDict[auraText] then auraDataDict[auraText] = {count = 0, order = uiLayoutOrder} end
-                        auraDataDict[auraText].count = auraDataDict[auraText].count + 1
-                        if uiLayoutOrder ~= 0 then auraDataDict[auraText].order = uiLayoutOrder end
-                    end
+    for _, obj in ipairs(mainUI:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Name == "TextLabel" and obj.Parent then
+            local parentName = obj.Parent.Name
+            if string.match(parentName, "^0%.%d+$") then
+                local auraText = obj.Text
+                if auraText ~= "" and auraText ~= "Undefined" and not string.match(auraText:lower():gsub("%s+", ""), "^x%d+$") then
+                    local uiLayoutOrder = 0
+                    pcall(function() uiLayoutOrder = obj.Parent.LayoutOrder end)
+                    if not auraDataDict[auraText] then auraDataDict[auraText] = {count = 0, order = uiLayoutOrder} end
+                    auraDataDict[auraText].count = auraDataDict[auraText].count + 1
+                    if uiLayoutOrder ~= 0 then auraDataDict[auraText].order = uiLayoutOrder end
                 end
             end
         end
         count = count + 1
-        if count % 30 == 0 then task.wait() end -- [PERF] yield ทุก 30 แทน 25 ลด overhead
+        if count % 100 == 0 then task.wait() end 
     end
     
     local sortedAuraList = {}
@@ -709,234 +673,117 @@ function GetAuraTableData()
 end
 
 -- ==========================================
--- ระบบคลิก + ระบบเช็คว่ากดติดหรือไม่
--- ==========================================
-
--- isTouchDevice: true เฉพาะมือถือที่ไม่มีคีย์บอร์ด
-local isTouchDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-
--- ==========================================
--- _snapState: เก็บ snapshot สถานะของปุ่มก่อนกด
--- ใช้เปรียบเทียบกับหลังกดเพื่อตรวจว่า UI ตอบสนองหรือไม่
--- ==========================================
-local function _snapState(element)
-    local s = { valid = false }
-    pcall(function()
-        if not element or not element.Parent then return end
-        s.valid        = true
-        s.visible      = element.Visible
-        s.sizeX        = element.AbsoluteSize.X
-        s.sizeY        = element.AbsoluteSize.Y
-        s.posX         = element.AbsolutePosition.X
-        s.posY         = element.AbsolutePosition.Y
-        s.bgTrans      = element.BackgroundTransparency
-        s.imgTrans     = pcall(function() return element.ImageTransparency end) and element.ImageTransparency or 0
-        s.parent       = element.Parent
-    end)
-    return s
-end
-
--- ==========================================
--- _isClickConfirmed: เปรียบเทียบ snapshot ก่อน/หลังกด
--- คืน true ถ้า UI มีการเปลี่ยนแปลง = กดติด
--- การเปลี่ยนแปลงที่ตรวจ:
---   1. หายไป (Visible false หรือ Parent nil)
---   2. ขนาดหด (button collapsed)
---   3. Transparency เพิ่มขึ้น (fade-out animation เริ่ม)
---   4. ตำแหน่งเปลี่ยน (slide-out animation)
--- ==========================================
-local function _isClickConfirmed(element, before)
-    if not before or not before.valid then return true end -- ถ้า snap ไม่ได้ ถือว่า OK
-    local ok = false
-    pcall(function()
-        -- กรณี 1: element หาย
-        if not element or not element.Parent then ok = true; return end
-        if not element.Visible then ok = true; return end
-        if element.AbsoluteSize.X <= 0 or element.AbsoluteSize.Y <= 0 then ok = true; return end
-        -- กรณี 2: parent เปลี่ยน (re-parented หรือถูก destroy)
-        if element.Parent ~= before.parent then ok = true; return end
-        -- กรณี 3: Transparency เพิ่มขึ้นอย่างน้อย 0.08 (animation เริ่ม)
-        if element.BackgroundTransparency - before.bgTrans > 0.08 then ok = true; return end
-        -- กรณี 4: ขนาดหดลงมากกว่า 20%
-        if before.sizeX > 10 and element.AbsoluteSize.X < before.sizeX * 0.8 then ok = true; return end
-        -- กรณี 5: ตำแหน่งเปลี่ยนเกิน 15px (slide animation)
-        local dx = math.abs(element.AbsolutePosition.X - before.posX)
-        local dy = math.abs(element.AbsolutePosition.Y - before.posY)
-        if dx > 15 or dy > 15 then ok = true; return end
-    end)
-    return ok
-end
-
--- ==========================================
--- clickVerified: คลิกปุ่ม + เช็คเร็วสุดๆว่ากดติดไหม + retry อัตโนมัติ
---
--- element   : GuiObject ที่จะกด
--- clickFn   : ฟังก์ชันที่ใช้กด (forceCraftClick / forceFishClick / forceActionClick)
--- maxRetries: จำนวน retry สูงสุด (default 3)
--- checkDelay: รอกี่วินาทีก่อนเช็ค (default 0.08 — เร็วสุดที่ UI จะ update)
--- customCheck: (optional) function(element) → bool ถ้าต้องการเงื่อนไขพิเศษ
---
--- คืน true ถ้ากดติดภายใน maxRetries
--- ==========================================
-local function clickVerified(element, clickFn, maxRetries, checkDelay, customCheck)
-    if not element then return false end
-    maxRetries = maxRetries or 3
-    checkDelay = checkDelay or 0.08
-    clickFn    = clickFn    or forceCraftClick  -- default
-
-    for attempt = 1, maxRetries do
-        -- snapshot ก่อนกด
-        local before = _snapState(element)
-
-        -- กด
-        clickFn(element)
-
-        -- รอให้ UI ตอบสนอง (0.08s = เร็วที่สุดที่ RBX render จะ update)
-        task.wait(checkDelay)
-
-        -- เช็คด้วย custom function ถ้ามี
-        if customCheck then
-            local ok = false
-            pcall(function() ok = customCheck(element) end)
-            if ok then return true end
-        else
-            -- เช็ค state เปลี่ยนหรือไม่
-            if _isClickConfirmed(element, before) then return true end
-        end
-
-        -- ยังไม่ติด — รอเพิ่มอีกนิดก่อน retry (exponential: 0.08 → 0.13 → 0.18)
-        if attempt < maxRetries then
-            task.wait(checkDelay * attempt * 0.6)
-        end
-    end
-
-    return false -- ครบ retry แล้วยังไม่ติด
-end
-
--- _touchId: วน 1-8 ป้องกัน stuck touch บน executor ที่ reuse ID
-local _touchId = 0
-local function nextTouchId()
-    _touchId = (_touchId % 8) + 1
-    return _touchId
-end
-
--- _sendClick: helper ส่ง Mouse + Touch event ไปยังพิกัดที่กำหนด
--- synchronous: caller yield 0.07s (mouse) หรือ 0.18s (mouse+touch)
--- ใช้ skipTouch=true เพื่อข้าม TouchEvent (เช่น กดปุ่ม Craft/Sell ที่ไม่ต้องการ touch ซ้อน)
-local function _sendClick(cx, cy, skipTouch)
-    pcall(function() vim:SendMouseButtonEvent(cx, cy, 0, true,  game, 1) end)
-    task.wait(0.06)
-    pcall(function() vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1) end)
-    if isTouchDevice and not skipTouch then
-        local tid = nextTouchId()
-        task.wait(0.03)
-        pcall(function() vim:SendTouchEvent(tid, Vector2.new(cx, cy), true)  end)
-        task.wait(0.06)
-        pcall(function() vim:SendTouchEvent(tid, Vector2.new(cx, cy), false) end)
-    end
-end
-
--- _getClickPos: แปลง AbsolutePosition → screen coordinate + clamp ในจอ
-local function _getClickPos(element)
-    local absPos  = element.AbsolutePosition
-    local absSize = element.AbsoluteSize
-    if absSize.X <= 0 or absSize.Y <= 0 then return nil, nil end
-    local inset = getCachedInset()
-    local vp    = camera.ViewportSize
-    return math.clamp(absPos.X + absSize.X * 0.5 + inset.X, 2, vp.X - 2),
-           math.clamp(absPos.Y + absSize.Y * 0.5 + inset.Y, 2, vp.Y - 2)
-end
-
--- _fireConnections: ยิง event connections โดยตรง — เร็วที่สุดถ้า executor support
--- คืน true ถ้ายิงได้อย่างน้อย 1 connection
-local function _fireConnections(element)
-    if not getconnections then return false end
-    local fired = false
-    pcall(function()
-        local btn = element
-        -- walk up หา GuiButton ถ้า element เป็น ImageLabel หรือ Label
-        if not btn:IsA("GuiButton") then
-            local p = btn.Parent
-            if p and p:IsA("GuiButton") then btn = p end
-        end
-        if not btn:IsA("GuiButton") then return end
-        local c1 = getconnections(btn.MouseButton1Click)
-        local c2 = getconnections(btn.Activated)
-        for _, c in ipairs(c1) do pcall(function() c:Fire() end) end
-        for _, c in ipairs(c2) do pcall(function() c:Fire() end) end
-        if (#c1 + #c2) > 0 then fired = true end
-    end)
-    return fired
-end
-
--- ==========================================
--- forceCraftClick — กด Craft / Sell / Dialog buttons
--- ใช้สำหรับปุ่ม UI ทั่วไป ที่ต้องการ synchronous (caller รอผล)
--- ลำดับ: connections ก่อน ถ้าไม่ได้ ค่อย coordinate
--- Mobile: ส่ง TouchEvent ด้วย (ป้องกันกรณี getconnections ไม่รองรับ)
+-- 1. ฟังก์ชันคลิกสำหรับ UI ทั่วไป และ Auto Craft
 -- ==========================================
 local function forceCraftClick(element)
     if not element then return false end
-    -- วิธี 1: fire connections (ไม่ block เวลา)
-    local fired = _fireConnections(element)
-    -- วิธี 2: coordinate click — ใช้ skipTouch=false เพื่อรองรับมือถือ
-    -- ถ้า connections ยิงได้แล้ว ยังส่ง coordinate ไปเพิ่มเติมเพื่อความมั่นใจ
-    -- (ป้องกันกรณี connection fire แต่ UI state ไม่อัพเดท)
-    local cx, cy = _getClickPos(element)
-    if cx then
-        pcall(function() _sendClick(cx, cy, false) end)
-    end
-    return fired or (cx ~= nil)
+    local successClicked = false
+    
+    pcall(function()
+        local button = element
+        if not button:IsA("GuiButton") and button.Parent and button.Parent:IsA("GuiButton") then 
+            button = button.Parent 
+        end
+        if getconnections and button:IsA("GuiButton") then
+            for _, conn in ipairs(getconnections(button.MouseButton1Click)) do pcall(function() conn:Fire() end) end
+            for _, conn in ipairs(getconnections(button.Activated)) do pcall(function() conn:Fire() end) end
+            successClicked = true
+        end
+    end)
+
+    pcall(function()
+        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+        if absSize.X > 0 and absSize.Y > 0 then
+            -- [FIX] ใช้ทั้ง inset.X และ inset.Y (เดิมลืม inset.X ทำให้พิกัดเพี้ยนบนจอกว้าง/มือถือบาง device)
+            local inset, _ = guiService:GetGuiInset()
+            local rawX = absPos.X + (absSize.X / 2) + inset.X
+            local rawY = absPos.Y + (absSize.Y / 2) + inset.Y
+            -- [FIX] Clamp พิกัดให้อยู่ในขอบจอ ป้องกันไปโดน UI อื่น
+            local vp = camera.ViewportSize
+            local margin = 2
+            local clickX = math.clamp(rawX, margin, vp.X - margin)
+            local clickY = math.clamp(rawY, margin, vp.Y - margin)
+
+            task.spawn(function()
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                task.wait(0.05)
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+            end)
+            successClicked = true
+        end
+    end)
+    
+    return successClicked
 end
 
 -- ==========================================
--- forceFishClick — กดปุ่ม Fish / ปุ่มใน fishing UI
--- ใช้ synchronous (caller รอผล) สำหรับ step-based fishing loop (0.3s)
--- Mobile: ส่ง TouchEvent ด้วย พร้อม ID วน
+-- 2. ฟังก์ชันคลิกเฉพาะหน้าจอ / ปุ่มสำหรับการตกปลา
 -- ==========================================
+-- [FIX] ตรวจสอบว่าเป็น Touch device จริงไหม ก่อนส่ง TouchEvent
+-- ป้องกันกรณีที่คอมพิวเตอร์ส่ง TouchEvent ซ้อน MouseEvent แล้วไปโดน UI อื่น
+local isTouchDevice = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
 local function forceFishClick(element)
     if not element then return false end
-    -- วิธี 1: connections
-    local fired = _fireConnections(element)
-    -- วิธี 2: coordinate + touch
-    local cx, cy = _getClickPos(element)
-    if cx then
-        pcall(function() _sendClick(cx, cy, false) end)
-    end
-    return fired or (cx ~= nil)
+    local successClicked = false
+
+    pcall(function()
+        local button = element
+        if not button:IsA("GuiButton") and button.Parent and button.Parent:IsA("GuiButton") then
+            button = button.Parent
+        end
+        if getconnections and button:IsA("GuiButton") then
+            local clickConns = getconnections(button.MouseButton1Click)
+            for _, conn in ipairs(clickConns) do pcall(function() conn:Fire() end) end
+            local activatedConns = getconnections(button.Activated)
+            for _, conn in ipairs(activatedConns) do pcall(function() conn:Fire() end) end
+            if (#clickConns > 0 or #activatedConns > 0) then
+                successClicked = true
+            end
+        end
+    end)
+
+    pcall(function()
+        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+        if absSize.X > 0 and absSize.Y > 0 then
+            -- [FIX] ใช้ทั้ง inset.X และ inset.Y + Clamp พิกัดให้อยู่ในขอบจอ
+            local inset, _ = guiService:GetGuiInset()
+            local rawX = absPos.X + (absSize.X / 2) + inset.X
+            local rawY = absPos.Y + (absSize.Y / 2) + inset.Y
+            local vp = camera.ViewportSize
+            local margin = 2
+            local clickX = math.clamp(rawX, margin, vp.X - margin)
+            local clickY = math.clamp(rawY, margin, vp.Y - margin)
+
+            task.spawn(function()
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                task.wait(0.05)
+                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+                -- [FIX] ส่ง TouchEvent เฉพาะ Touch device จริงๆ เท่านั้น
+                -- บนคอมพิวเตอร์การส่ง TouchEvent ซ้อนกันทำให้ไปโดน UI อื่น
+                if isTouchDevice then
+                    task.wait(0.02)
+                    pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), true) end)
+                    task.wait(0.05)
+                    pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), false) end)
+                end
+            end)
+            successClicked = true
+        end
+    end)
+
+    return successClicked
 end
 
--- ==========================================
--- forceActionClick — กด Action Button และ Confirm (มือถือ-first)
--- synchronous: caller รอผล แล้วเช็คว่าปุ่มหายหรือยัง
--- เหมือน forceFishClick แต่ใช้ชื่อแยกเพื่อความชัดเจนในโค้ด
--- ==========================================
-local function forceActionClick(element)
-    if not element then return false end
-    local fired = _fireConnections(element)
-    local cx, cy = _getClickPos(element)
-    if cx then
-        pcall(function() _sendClick(cx, cy, false) end)
-    end
-    return fired or (cx ~= nil)
-end
-
--- ==========================================
--- clickOnce — กด screen กลางจอ (ใช้ใน minigame loop 0.07s)
--- MUST ใช้ task.spawn — fire-and-forget ห้าม block loop
--- ถ้าทำ synchronous: loop 0.07s + task.wait(0.06) = 0.13s/รอบ → คลิกช้าลงครึ่ง
--- ==========================================
 local function clickOnce()
     task.spawn(function()
-        local inset = getCachedInset()
-        local vp = camera.ViewportSize
-        local cx = vp.X * 0.5 + inset.X
-        local cy = vp.Y * 0.5 + inset.Y
-        pcall(function() vim:SendMouseButtonEvent(cx, cy, 0, true,  game, 1) end)
-        task.wait(0.05)
-        pcall(function() vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1) end)
-        -- minigame ใช้ screen-center click ไม่ต้องการ TouchEvent
-        -- (minigame ตรวจ mouse position ไม่ใช่ touch)
+        -- [FIX] ใช้ inset ให้ถูกต้องใน clickOnce ด้วย
+        local inset, _ = guiService:GetGuiInset()
+        local safeX = camera.ViewportSize.X * 0.5 + inset.X
+        local safeY = camera.ViewportSize.Y * 0.5 + inset.Y
+        pcall(function() vim:SendMouseButtonEvent(safeX, safeY, 0, true, game, 1) end)
+        task.wait(0.05) 
+        pcall(function() vim:SendMouseButtonEvent(safeX, safeY, 0, false, game, 1) end)
     end)
 end
 
@@ -1031,6 +878,44 @@ local function walkToTarget(targetPos, locationName)
     end
 end
 
+-- ==========================================
+-- [OPT] Shared helper: ค้นหา Action Button (ImageLabel>ImageLabel>ImageButton) ใน mainUI
+-- ใช้แทน nested loop ที่ซ้ำกัน 5+ จุด ลด CPU จากการ traverse ซ้ำ
+-- ==========================================
+local _cachedActionBtn, _cachedActionContainer = nil, nil
+local _actionSearchTick = 0
+
+local function findActionBtnFast(mainUI, forceRefresh)
+    -- cache valid for 0.2s ไม่ต้อง search ซ้ำถ้าเรียกถี่กว่านั้น
+    if not forceRefresh and _cachedActionBtn and (tick() - _actionSearchTick) < 0.2 then
+        local ok = pcall(function()
+            return _cachedActionBtn.Parent and _cachedActionBtn.Visible and _cachedActionBtn.AbsoluteSize.X > 0
+        end)
+        if ok then return _cachedActionBtn, _cachedActionContainer end
+    end
+    _cachedActionBtn, _cachedActionContainer = nil, nil
+    _actionSearchTick = tick()
+    
+    pcall(function()
+        for _, lv1 in ipairs(mainUI:GetChildren()) do
+            if lv1:IsA("ImageLabel") then
+                for _, lv2 in ipairs(lv1:GetChildren()) do
+                    if lv2:IsA("ImageLabel") then
+                        for _, lv3 in ipairs(lv2:GetChildren()) do
+                            if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
+                                _cachedActionBtn = lv3
+                                _cachedActionContainer = lv2
+                                return
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return _cachedActionBtn, _cachedActionContainer
+end
+
 local function isCacheValid(element)
     if not element then return false end
     if not element.Parent then return false end
@@ -1040,11 +925,6 @@ local function isCacheValid(element)
     return true
 end
 
--- ==========================================
--- [PERF] getExtraButton — ไม่ใช้ GetDescendants() fallback อีกต่อไป
--- Action Button อยู่ที่ depth 3 เสมอ: mainUI → ImageLabel → ImageLabel → ImageButton
--- scan แค่ 3 levels ด้วย GetChildren() = O(children) ไม่ใช่ O(descendants)
--- ==========================================
 local function getExtraButton(mainUI)
     if cachedExtraBtn and cachedExtraBtn.Parent and cachedExtraBtn:IsDescendantOf(playerGui) then
         local ok, vis = pcall(function() return cachedExtraBtn.Visible end)
@@ -1054,97 +934,43 @@ local function getExtraButton(mainUI)
     end
     cachedExtraBtn = nil
 
-    -- Pass 1: exact path mainUI→ImageLabel→ImageLabel→ImageButton (depth 3)
-    pcall(function()
-        for _, lv1 in ipairs(mainUI:GetChildren()) do
-            if lv1:IsA("ImageLabel") then
-                for _, lv2 in ipairs(lv1:GetChildren()) do
-                    if lv2:IsA("ImageLabel") then
-                        for _, lv3 in ipairs(lv2:GetChildren()) do
-                            if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
-                                cachedExtraBtn = lv3
-                                return
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    if cachedExtraBtn then return cachedExtraBtn end
-
-    -- Pass 2: depth-4 fallback (mainUI→*→ImageLabel→ImageLabel→ImageButton)
-    -- [PERF] ยังคงใช้ GetChildren() เท่านั้น ไม่ใช้ GetDescendants()
-    pcall(function()
-        for _, lv0 in ipairs(mainUI:GetChildren()) do
-            for _, lv1 in ipairs(lv0:GetChildren()) do
-                if lv1:IsA("ImageLabel") then
-                    for _, lv2 in ipairs(lv1:GetChildren()) do
-                        if lv2:IsA("ImageLabel") then
-                            for _, lv3 in ipairs(lv2:GetChildren()) do
-                                if lv3:IsA("ImageButton") and lv3.Visible
-                                   and lv3.AbsoluteSize.X > 20 and lv3.AbsoluteSize.Y > 20 then
-                                    cachedExtraBtn = lv3
-                                    return
-                                end
-                            end
-                        end
-                    end
-                end
-                if cachedExtraBtn then return end
-            end
-            if cachedExtraBtn then return end
-        end
-    end)
+    -- [OPT] ใช้ findActionBtnFast แทน scan ซ้ำ
+    local fastBtn, _ = findActionBtnFast(mainUI, true)
+    if fastBtn then
+        cachedExtraBtn = fastBtn
+        return cachedExtraBtn
+    end
 
     return cachedExtraBtn
 end
 
--- ==========================================
--- [PERF] getFishButton — แทน GetDescendants() ด้วย BFS depth-limited
--- Fish button อยู่ตื้นมาก: mainUI → Frame/ImageLabel → ImageButton[TextLabel "Fish"]
--- scan แค่ 3 levels ด้วย GetChildren() เท่านั้น
--- ==========================================
 local function getFishButton(mainUI)
     if cachedFishBtn and cachedFishBtn.Parent and cachedFishBtn:IsDescendantOf(playerGui) then
         return cachedFishBtn
     end
     cachedFishBtn = nil
 
-    local function isFishBtn(btn)
-        if not (btn:IsA("ImageButton") or btn:IsA("TextButton") or btn:IsA("GuiButton")) then return false end
-        -- ตรวจ Text ตรงบน btn
-        if btn:IsA("TextButton") and (btn.Text == "Fish" or btn.Text:lower() == "fish") then return true end
-        -- ตรวจ TextLabel ลูกของ btn
-        for _, child in ipairs(btn:GetChildren()) do
-            if child:IsA("TextLabel") and (child.Text == "Fish" or child.Text:lower() == "fish") then
-                return true
+    for _, element in ipairs(mainUI:GetDescendants()) do
+        if element:IsA("TextLabel") then
+            local txt = element.Text
+            if txt == "Fish" or txt:lower() == "fish" then
+                local parentBtn = element.Parent
+                if parentBtn and (parentBtn:IsA("ImageButton") or parentBtn:IsA("TextButton") or parentBtn:IsA("GuiButton")) then
+                    cachedFishBtn = parentBtn
+                    return cachedFishBtn
+                end
+                local grandParent = parentBtn and parentBtn.Parent
+                if grandParent and (grandParent:IsA("ImageButton") or grandParent:IsA("TextButton") or grandParent:IsA("GuiButton")) then
+                    cachedFishBtn = grandParent
+                    return cachedFishBtn
+                end
             end
         end
-        return false
     end
-
-    -- scan depth 1-3 ด้วย GetChildren() ไม่ใช้ GetDescendants()
-    for _, lv1 in ipairs(mainUI:GetChildren()) do
-        if isFishBtn(lv1) then cachedFishBtn = lv1; break end
-        for _, lv2 in ipairs(lv1:GetChildren()) do
-            if isFishBtn(lv2) then cachedFishBtn = lv2; break end
-            for _, lv3 in ipairs(lv2:GetChildren()) do
-                if isFishBtn(lv3) then cachedFishBtn = lv3; break end
-            end
-            if cachedFishBtn then break end
-        end
-        if cachedFishBtn then break end
-    end
-    return cachedFishBtn
+    return nil
 end
 
--- ==========================================
--- [PERF] getExactMinigameElements — แทน GetDescendants() ด้วย path walk
--- Minigame bar อยู่ที่ depth 4: mainUI→IL→IL→IL→IL(container)
--- เดิน path 4 levels ด้วย GetChildren() = O(children×4) แทน O(descendants)
--- ==========================================
-local lastMinigameScanTime = 0
+local lastMinigameScanTime = 0 
 local function getExactMinigameElements()
     if isCacheValid(cachedSafeZone) and isCacheValid(cachedDiamond) then
         return cachedSafeZone, cachedDiamond
@@ -1153,32 +979,30 @@ local function getExactMinigameElements()
     if tick() - lastMinigameScanTime < 1 then return nil, nil end
     lastMinigameScanTime = tick()
 
-    local mainUI = getCachedMainUI()
+    local mainUI = playerGui:FindFirstChild("MainInterface")
     if not mainUI then return nil, nil end
 
-    -- [PERF] walk path 4 levels deep ด้วย GetChildren() เท่านั้น
-    -- path: mainUI → ImageLabel(lv1) → ImageLabel(lv2) → ImageLabel(lv3) → ImageLabel(container)
-    -- container มี ImageLabel children ที่เป็น safezone + diamond
-    for _, lv1 in ipairs(mainUI:GetChildren()) do
-        if not lv1:IsA("ImageLabel") then continue end
-        for _, lv2 in ipairs(lv1:GetChildren()) do
-            if not lv2:IsA("ImageLabel") then continue end
-            for _, lv3 in ipairs(lv2:GetChildren()) do
-                if not lv3:IsA("ImageLabel") then continue end
-                for _, container in ipairs(lv3:GetChildren()) do
-                    if not container:IsA("ImageLabel") then continue end
-                    -- ตรวจว่า container นี้มี ImageLabel children เพียงพอ
-                    local validChildren = {}
-                    for _, child in ipairs(container:GetChildren()) do
-                        if child:IsA("ImageLabel") then
-                            table.insert(validChildren, child)
+    for _, container in ipairs(mainUI:GetDescendants()) do
+        if container:IsA("ImageLabel") then
+            local p3 = container.Parent
+            if p3 and p3.Name == "ImageLabel" then
+                local p4 = p3.Parent
+                if p4 and p4.Name == "ImageLabel" then
+                    local p5 = p4.Parent
+                    if p5 and p5.Name == "ImageLabel" then
+                        local root = p5.Parent
+                        if root and root.Name == "MainInterface" then
+                            local validChildren = {}
+                            for _, child in ipairs(container:GetChildren()) do
+                                if child:IsA("ImageLabel") then table.insert(validChildren, child) end
+                            end
+                            if #validChildren >= 2 then
+                                table.sort(validChildren, function(a, b) return a.AbsoluteSize.X > b.AbsoluteSize.X end)
+                                cachedSafeZone = (#validChildren >= 3) and validChildren[2] or validChildren[1]
+                                cachedDiamond = validChildren[#validChildren]
+                                return cachedSafeZone, cachedDiamond
+                            end
                         end
-                    end
-                    if #validChildren >= 2 then
-                        table.sort(validChildren, function(a, b) return a.AbsoluteSize.X > b.AbsoluteSize.X end)
-                        cachedSafeZone = (#validChildren >= 3) and validChildren[2] or validChildren[1]
-                        cachedDiamond  = validChildren[#validChildren]
-                        return cachedSafeZone, cachedDiamond
                     end
                 end
             end
@@ -1198,7 +1022,7 @@ local uiHeight = math.clamp(vpSize.Y - 50, 250, 460)
 local tabWidth = uiWidth < 450 and 120 or 160
 
 local Window = Fluent:CreateWindow({
-    Title = "XT-HUB [1.3]",
+    Title = "XT-HUB [1.7]",
     SubTitle = "Sol's RNG",
     TabWidth = tabWidth,
     Size = UDim2.fromOffset(uiWidth, uiHeight),
@@ -1441,13 +1265,14 @@ ShowDetectToggle:OnChanged(function(Value)
 end)
 
 task.spawn(function()
-    -- [PERF] diagnostics loop ช้าลงเป็น 0.5s — เป็นแค่ debug overlay ไม่ต้องถี่
     while task.wait(0.5) do
         if not DetectDebugLabel then continue end
+
+        -- [FIX] ถ้า overlay ปิด ไม่ต้องเขียน UI เลย ข้ามไปได้เลย
         if not showDetectOverlay then continue end
 
         pcall(function()
-            local mainUI = getCachedMainUI()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
             if not mainUI then
                 DetectDebugLabel:SetTitle("🔍 Detection Diagnostics [ERROR]")
                 DetectDebugLabel:SetDesc("System Error: MainInterface not found. Are you fully loaded into the game?")
@@ -1475,10 +1300,14 @@ task.spawn(function()
                         local xScl = child.Size.X.Scale
                         if math.abs(xOff - 250) <= 2 or math.abs(xScl - 0.185) <= 0.005 then
                             local bg1 = child.BackgroundTransparency
-                            -- [PERF] ลบ task.wait(0.08) ออกจาก loop
-                            -- diagnostics ไม่ต้องการ realtime anim check แค่แสดง state ปัจจุบัน
+                            task.wait(0.08)
+                            local bg2 = child.BackgroundTransparency
+                            local isAnimating = math.abs(bg1 - bg2) >= 0.05
                             local isActive = bg1 <= 0.6
-                            if isActive then
+                            
+                            if isAnimating then
+                                return "Processing (Animating) 🔄"
+                            elseif isActive then
                                 return "Ready to Click ✅"
                             else
                                 return "Standby ⏳"
@@ -1495,24 +1324,14 @@ task.spawn(function()
 
             local actionPosStatus = "Unavailable"
             pcall(function()
-                for _, lv1 in ipairs(mainUI:GetChildren()) do
-                    if lv1:IsA("ImageLabel") then
-                        for _, lv2 in ipairs(lv1:GetChildren()) do
-                            if lv2:IsA("ImageLabel") then
-                                for _, lv3 in ipairs(lv2:GetChildren()) do
-                                    if lv3:IsA("ImageButton") and lv3.Visible then
-                                        local pos = lv3.Position
-                                        local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
-                                        local xOffOK   = math.abs(pos.X.Offset)    < 5
-                                        local yOK      = math.abs(pos.Y.Scale)      < 0.05 and math.abs(pos.Y.Offset) < 5
-                                        local ready = xScaleOK and xOffOK and yOK
-                                        actionPosStatus = ready and "In Position ✅" or "Moving... 🔄"
-                                        return
-                                    end
-                                end
-                            end
-                        end
-                    end
+                local actBtnDiag, _ = findActionBtnFast(mainUI)
+                if actBtnDiag and actBtnDiag.Visible then
+                    local pos = actBtnDiag.Position
+                    local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
+                    local xOffOK   = math.abs(pos.X.Offset)    < 5
+                    local yOK      = math.abs(pos.Y.Scale)      < 0.05 and math.abs(pos.Y.Offset) < 5
+                    local ready = xScaleOK and xOffOK and yOK
+                    actionPosStatus = ready and "In Position ✅" or "Moving... 🔄"
                 end
             end)
 
@@ -1596,15 +1415,15 @@ local lblMini    = makeLabel("Minigame", Color3.fromRGB(80,  160, 255))
 local lblAction  = makeLabel("Action",   Color3.fromRGB(255, 180,  50))
 local lblConfirm = makeLabel("Confirm",  Color3.fromRGB(255,  80,  80))
 
-local inset = getCachedInset()
+local inset = guiService:GetGuiInset()
 
 -- [FIX] ช้าลงจาก 0.1s → 0.25s ลด CPU ลงครึ่งนึง
 -- และ skip งานทั้งหมดทันทีถ้า overlay ปิด (เดิมยังวน loop hide ทุก 0.1s อยู่)
 task.spawn(function()
     local overlayWasVisible = false
-    -- [PERF] 0.35s แทน 0.25s — visual overlay ไม่ต้องอัพเดท 4x/วินาที, 3x พอ
-    while task.wait(0.35) do
+    while task.wait(0.25) do
         if not showDetectOverlay then
+            -- ซ่อนครั้งเดียวพอ ไม่ต้อง set ทุก 0.25s
             if overlayWasVisible then
                 overlayWasVisible = false
                 setBoxVisible(boxFish, false)
@@ -1618,7 +1437,7 @@ task.spawn(function()
         overlayWasVisible = true
 
         pcall(function()
-            local mainUI = getCachedMainUI()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
             if not mainUI then
                 setBoxVisible(boxFish, false); setBoxVisible(boxMini, false)
                 setBoxVisible(boxAction, false); setBoxVisible(boxConfirm, false)
@@ -1626,65 +1445,67 @@ task.spawn(function()
                 return
             end
 
-            -- [PERF] รวม 4 passes GetChildren() เป็น pass เดียว
-            local fishFound, miniFound = false, false
+            local fishFound = false
             for _, child in ipairs(mainUI:GetChildren()) do
-                if not (child:IsA("GuiObject") and child.Visible) then continue end
-                local xOff, xScl = child.Size.X.Offset, child.Size.X.Scale
-                if not fishFound and (math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005) then
-                    local ap, as = child.AbsolutePosition, child.AbsoluteSize
-                    updateBox(boxFish, ap.X, ap.Y + inset.Y, as.X, as.Y)
-                    setBoxVisible(boxFish, true)
-                    lblFish.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
-                    lblFish.Visible = true
-                    fishFound = true
+                if child:IsA("GuiObject") and child.Visible then
+                    local xOff, xScl = child.Size.X.Offset, child.Size.X.Scale
+                    if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
+                        local ap = child.AbsolutePosition
+                        local as = child.AbsoluteSize
+                        updateBox(boxFish, ap.X, ap.Y + inset.Y, as.X, as.Y)
+                        setBoxVisible(boxFish, true)
+                        lblFish.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                        lblFish.Visible = true
+                        fishFound = true
+                        break
+                    end
                 end
-                if not miniFound and (math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005) then
-                    local ap, as = child.AbsolutePosition, child.AbsoluteSize
-                    updateBox(boxMini, ap.X, ap.Y + inset.Y, as.X, as.Y)
-                    setBoxVisible(boxMini, true)
-                    lblMini.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
-                    lblMini.Visible = true
-                    miniFound = true
-                end
-                if fishFound and miniFound then break end
             end
             if not fishFound then setBoxVisible(boxFish, false); lblFish.Visible = false end
+
+            local miniFound = false
+            for _, child in ipairs(mainUI:GetChildren()) do
+                if child:IsA("GuiObject") and child.Visible then
+                    local xOff, xScl = child.Size.X.Offset, child.Size.X.Scale
+                    if math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
+                        local ap = child.AbsolutePosition
+                        local as = child.AbsoluteSize
+                        updateBox(boxMini, ap.X, ap.Y + inset.Y, as.X, as.Y)
+                        setBoxVisible(boxMini, true)
+                        lblMini.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                        lblMini.Visible = true
+                        miniFound = true
+                        break
+                    end
+                end
+            end
             if not miniFound then setBoxVisible(boxMini, false); lblMini.Visible = false end
 
             local actionFound = false
-            for _, lv1 in ipairs(mainUI:GetChildren()) do
-                if not lv1:IsA("ImageLabel") then continue end
-                for _, lv2 in ipairs(lv1:GetChildren()) do
-                    if not lv2:IsA("ImageLabel") then continue end
-                    for _, lv3 in ipairs(lv2:GetChildren()) do
-                        if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
-                            local ap, as = lv3.AbsolutePosition, lv3.AbsoluteSize
-                            updateBox(boxAction, ap.X, ap.Y + inset.Y, as.X, as.Y, 2)
-                            setBoxVisible(boxAction, true)
-                            lblAction.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
-                            lblAction.Visible = true
-                            actionFound = true
+            local actBtn, _ = findActionBtnFast(mainUI, true)
+            if actBtn then
+                local ap = actBtn.AbsolutePosition
+                local as = actBtn.AbsoluteSize
+                updateBox(boxAction, ap.X, ap.Y + inset.Y, as.X, as.Y, 2)
+                setBoxVisible(boxAction, true)
+                lblAction.Position = UDim2.new(0, ap.X, 0, ap.Y + inset.Y - 16)
+                lblAction.Visible = true
+                actionFound = true
 
-                            local confirmFound = false
-                            for _, child in ipairs(lv3:GetChildren()) do
-                                if child:IsA("ImageLabel") and child.Visible and child.AbsoluteSize.X > 0 then
-                                    local cap, cas = child.AbsolutePosition, child.AbsoluteSize
-                                    updateBox(boxConfirm, cap.X, cap.Y + inset.Y, cas.X, cas.Y, 2)
-                                    setBoxVisible(boxConfirm, true)
-                                    lblConfirm.Position = UDim2.new(0, cap.X, 0, cap.Y + inset.Y - 16)
-                                    lblConfirm.Visible = true
-                                    confirmFound = true
-                                    break
-                                end
-                            end
-                            if not confirmFound then setBoxVisible(boxConfirm, false); lblConfirm.Visible = false end
-                            break
-                        end
+                local confirmFound = false
+                for _, child in ipairs(actBtn:GetChildren()) do
+                    if child:IsA("ImageLabel") and child.Visible and child.AbsoluteSize.X > 0 then
+                        local cap = child.AbsolutePosition
+                        local cas = child.AbsoluteSize
+                        updateBox(boxConfirm, cap.X, cap.Y + inset.Y, cas.X, cas.Y, 2)
+                        setBoxVisible(boxConfirm, true)
+                        lblConfirm.Position = UDim2.new(0, cap.X, 0, cap.Y + inset.Y - 16)
+                        lblConfirm.Visible = true
+                        confirmFound = true
+                        break
                     end
-                    if actionFound then break end
                 end
-                if actionFound then break end
+                if not confirmFound then setBoxVisible(boxConfirm, false); lblConfirm.Visible = false end
             end
             if not actionFound then
                 setBoxVisible(boxAction, false); lblAction.Visible = false
@@ -1844,7 +1665,7 @@ IncognitoToggle:OnChanged(function(Value)
     end
 end)
 
-Tabs.Webhook:AddParagraph({ Title = "Information", Content = "Developed by XT-HUB [1.3]" })
+Tabs.Webhook:AddParagraph({ Title = "Information", Content = "Developed by XT-HUB [1.7]" })
 
 -- ==========================================
 -- [ADD] Biome Webhook UI
@@ -1965,8 +1786,8 @@ local function ProcessDetectQueue()
             SendMerchantWebhook(entityName, false, false)
             ShowGameNotification(entityName)
             
-            -- [PERF] task.delay ไม่ leak coroutine ต่างจาก task.spawn(task.wait(180))
-            task.delay(180, function()
+            task.spawn(function()
+                task.wait(180) 
                 SendMerchantWebhook(entityName, false, true)
             end)
 
@@ -2061,62 +1882,31 @@ end
 
 local npcNames = {Mari = true, Rin = true, Jester = true}
 
--- [PERF] NPC tracking ด้วย events แทน GetDescendants() loop
--- GetDescendants() บน Workspace มีพัน object — เรียกทุก 5s กิน CPU มาก
--- ใช้ DescendantAdded/DescendantRemoving แทน: O(1) ต่อเหตุการณ์
-local _npcPresent = {}  -- track NPC ที่อยู่ใน workspace ตอนนี้
-
 Workspace.DescendantAdded:Connect(function(obj)
     if obj:IsA("Model") and npcNames[obj.Name] then
         task.wait(0.1)
-        if obj.Parent and not _npcPresent[obj.Name] then
-            _npcPresent[obj.Name] = obj
+        if obj.Parent then
             HandleNPCDetection(obj.Name)
         end
     end
 end)
 
-Workspace.DescendantRemoving:Connect(function(obj)
-    if obj:IsA("Model") and npcNames[obj.Name] then
-        if _npcPresent[obj.Name] == obj then
-            _npcPresent[obj.Name] = nil
-        end
-    end
-end)
-
--- backup scan: ทุก 15s (ไม่ใช่ 5s) เฉพาะกรณี event miss
--- [PERF] ใช้ GetChildren() ของแต่ละ folder ใน Workspace แทน GetDescendants()
--- ถ้าไม่เจอใน children ระดับแรก ค่อย scan descendants แค่ folder ที่น่าสงสัย
+-- [OPT] scan loop backup: ทุก 8s ตรวจ Workspace — single pass แทน 2 pass
+-- เดิม GetDescendants() 2 ครั้ง (scan + cleanup) ตอนนี้เหลือ 1 ครั้ง
 task.spawn(function()
-    while task.wait(15) do
+    local lastSeen = {}
+    while task.wait(8) do
         pcall(function()
-            -- เคลียร์ NPC ที่ event อาจ miss
-            for name, obj in pairs(_npcPresent) do
-                if not obj or not obj.Parent then
-                    _npcPresent[name] = nil
-                end
-            end
-            -- scan เฉพาะ direct children + 1 level deep (ไม่ full descendants)
-            for _, child in ipairs(Workspace:GetChildren()) do
-                if child:IsA("Model") and npcNames[child.Name] and child.Parent then
-                    if not _npcPresent[child.Name] then
-                        _npcPresent[child.Name] = child
-                        HandleNPCDetection(child.Name)
-                    end
-                    continue
-                end
-                -- folder/model ที่อาจห่อ NPC ไว้ข้างใน
-                if child:IsA("Folder") or child:IsA("Model") then
-                    for _, inner in ipairs(child:GetChildren()) do
-                        if inner:IsA("Model") and npcNames[inner.Name] and inner.Parent then
-                            if not _npcPresent[inner.Name] then
-                                _npcPresent[inner.Name] = inner
-                                HandleNPCDetection(inner.Name)
-                            end
-                        end
+            local currentlySeen = {}
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("Model") and npcNames[obj.Name] and obj.Parent then
+                    currentlySeen[obj.Name] = true
+                    if not lastSeen[obj.Name] then
+                        HandleNPCDetection(obj.Name)
                     end
                 end
             end
+            lastSeen = currentlySeen
         end)
     end
 end)
@@ -2158,7 +1948,7 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while task.wait(15) do
+    while task.wait(20) do
         pcall(function()
             if RollsLabel then RollsLabel:SetTitle("Total Rolls : " .. FormatNumber(GetPlayerRolls())) end
             if LuckLabel then LuckLabel:SetTitle("Current Luck : x" .. string.format("%.2f", tonumber(GetPlayerLuck()) or 1)) end
@@ -2169,7 +1959,8 @@ end)
 
 local lastWebhookSendTick = tick()
 task.spawn(function()
-    while task.wait(5) do
+    -- [OPT] เช็คทุก 15s แทน 5s — webhook interval ส่วนใหญ่ตั้งไว้ 30-60s อยู่แล้ว
+    while task.wait(15) do
         local safeInterval = tonumber(saveIntervalSeconds) or 60
         if isInfoWebhookEnabled and (tick() - lastWebhookSendTick >= safeInterval) then
             lastWebhookSendTick = tick()
@@ -2302,6 +2093,27 @@ end
 
 _G.IsCraftingExpected = false
 
+-- [OPT] Cached popup finder — ลด GetDescendants จาก 2 จุดเหลือ 1 ครั้งต่อรอบ
+local _cachedPopupRoot = nil
+local _popupSearchTick = 0
+local function findAddIngredientsPopup(forceRefresh)
+    if not forceRefresh and _cachedPopupRoot and (tick() - _popupSearchTick) < 0.3 then
+        local ok = pcall(function() return _cachedPopupRoot.Parent and _cachedPopupRoot.Visible end)
+        if ok then return _cachedPopupRoot end
+    end
+    _cachedPopupRoot = nil
+    _popupSearchTick = tick()
+    pcall(function()
+        for _, gui in ipairs(playerGui:GetDescendants()) do
+            if gui:IsA("TextLabel") and gui.Visible and string.lower(TrimString(gui.Text)) == "add ingredients" then
+                _cachedPopupRoot = gui.Parent
+                return
+            end
+        end
+    end)
+    return _cachedPopupRoot
+end
+
 task.spawn(function()
     while task.wait(scanCooldown) do
         if not masterAutoEnabled then
@@ -2318,10 +2130,7 @@ task.spawn(function()
 
         pcall(function()
             if not cachedRecipeHolder or not cachedRecipeHolder.Parent then
-                -- [PERF] scan mainUI เท่านั้น ไม่ scan playerGui:GetDescendants()
-                local mainUI2 = getCachedMainUI()
-                local searchRoot = mainUI2 or playerGui
-                for _, h in ipairs(searchRoot:GetDescendants()) do
+                for _, h in pairs(playerGui:GetDescendants()) do
                     if h.Name == "indexIngredientsHolder" and h:IsA("GuiObject") then
                         cachedRecipeHolder = h
                         break
@@ -2334,27 +2143,16 @@ task.spawn(function()
                 if holder.AbsoluteSize.Y > 20 and holder.Visible then
                     isRecipeOpen = true
                     
-                    local uiRoot = holder.Parent.Parent.Parent
+                    local uiRoot = holder.Parent.Parent.Parent 
                     local largestTextSize = 0
-                    -- [PERF] scan depth 3 ด้วย GetChildren() แทน GetDescendants()
-                    local function checkLabel(obj)
+                    for _, obj in pairs(uiRoot:GetDescendants()) do
                         if obj:IsA("TextLabel") and obj.Text ~= "" and obj.Visible then
                             local t = obj.Text
-                            if not string.find(t, "/") and not string.find(t, "%- Recipe %-")
-                               and t ~= "Open Recipe" and t ~= "Auto" and t ~= "Craft" then
+                            if not string.find(t, "/") and not string.find(t, "%- Recipe %-") and t ~= "Open Recipe" and t ~= "Auto" and t ~= "Craft" then
                                 if obj.TextSize > largestTextSize then
                                     largestTextSize = obj.TextSize
                                     currentItemName = t
                                 end
-                            end
-                        end
-                    end
-                    for _, c1 in ipairs(uiRoot:GetChildren()) do
-                        checkLabel(c1)
-                        for _, c2 in ipairs(c1:GetChildren()) do
-                            checkLabel(c2)
-                            for _, c3 in ipairs(c2:GetChildren()) do
-                                checkLabel(c3)
                             end
                         end
                     end
@@ -2367,8 +2165,7 @@ task.spawn(function()
                             local matReq = 0
                             local addBtn = nil
                             
-                            -- [PERF] GetDescendants() → depth 2 GetChildren() (itemFrame ไม่ลึก)
-                            local function scanIngredientNode(label)
+                            for _, label in pairs(itemFrame:GetDescendants()) do
                                 if label:IsA("TextLabel") and label.Text ~= "" then
                                     local txtStr = label.Text
                                     if string.find(txtStr, "/") and string.find(txtStr, "%(") then
@@ -2377,7 +2174,9 @@ task.spawn(function()
                                         if #splitData == 2 then
                                             matCur = tonumber(splitData[1]) or 0
                                             matReq = tonumber(splitData[2]) or 0
-                                            if matCur < matReq then isReadyToCraft = false end
+                                            if matCur < matReq then
+                                                isReadyToCraft = false 
+                                            end
                                         end
                                     elseif not tonumber(txtStr) and txtStr:lower() ~= "add" and not string.find(txtStr:lower(), "everything") then
                                         if label.Parent and not label.Parent:IsA("GuiButton") then
@@ -2385,14 +2184,12 @@ task.spawn(function()
                                         end
                                     end
                                 end
+                                
                                 if label:IsA("GuiButton") then
-                                    if getButtonText(label) == "add" then addBtn = label end
-                                end
-                            end
-                            for _, c1 in ipairs(itemFrame:GetChildren()) do
-                                scanIngredientNode(c1)
-                                for _, c2 in ipairs(c1:GetChildren()) do
-                                    scanIngredientNode(c2)
+                                    local btxt = getButtonText(label)
+                                    if btxt == "add" then
+                                        addBtn = label
+                                    end
                                 end
                             end
                             
@@ -2420,25 +2217,30 @@ task.spawn(function()
                                  or (not cachedButtons.open or not cachedButtons.open.Parent or not cachedButtons.open.Visible)
             
             if btnCacheMissing then
-                -- [PERF] scan ใน mainUI เท่านั้น ไม่ scan playerGui:GetDescendants() ทั้งหมด
-                -- craft UI อยู่ใน MainInterface เสมอ
                 cachedButtons = { open = nil, auto = nil, craft = nil }
-                local mainUI2 = getCachedMainUI()
-                local searchRoot = mainUI2 or playerGui
+                local foundCount = 0
+                -- [OPT] scan เฉพาะ ScreenGui ที่มี cachedRecipeHolder อยู่ แทน scan ทั้ง playerGui
+                local searchRoot = playerGui
+                if cachedRecipeHolder and cachedRecipeHolder.Parent then
+                    local ancestor = cachedRecipeHolder
+                    while ancestor and ancestor.Parent and ancestor.Parent ~= playerGui do
+                        ancestor = ancestor.Parent
+                    end
+                    if ancestor and ancestor:IsA("ScreenGui") then searchRoot = ancestor end
+                end
                 for _, obj in ipairs(searchRoot:GetDescendants()) do
+                    if foundCount >= 3 then break end
                     if obj:IsA("GuiButton") and obj.AbsoluteSize.X > 0 and isObjectActuallyVisible(obj) then 
                         local txt = getButtonText(obj)
                         txt = txt:gsub("^%s+", ""):gsub("%s+$", "") 
                         
-                        if txt == "open recipe" then 
-                            cachedButtons.open = obj
-                        elseif txt == "auto" then 
-                            cachedButtons.auto = obj
-                        elseif txt == "craft" then 
-                            cachedButtons.craft = obj
+                        if txt == "open recipe" and not cachedButtons.open then 
+                            cachedButtons.open = obj; foundCount = foundCount + 1
+                        elseif txt == "auto" and not cachedButtons.auto then 
+                            cachedButtons.auto = obj; foundCount = foundCount + 1
+                        elseif txt == "craft" and not cachedButtons.craft then 
+                            cachedButtons.craft = obj; foundCount = foundCount + 1
                         end
-                        -- early exit ถ้าได้ครบสามปุ่มแล้ว
-                        if cachedButtons.open and cachedButtons.auto and cachedButtons.craft then break end
                     end
                 end
             end
@@ -2664,15 +2466,7 @@ task.spawn(function()
                             end
                         end
                     elseif multiCraftState == "WAIT_RECIPE" then
-                        local popupRoot = nil
-                        -- [PERF] scan mainUI เท่านั้น ไม่ scan playerGui ทั้งหมด
-                        local _mUI = getCachedMainUI() or playerGui
-                        for _, gui in ipairs(_mUI:GetDescendants()) do
-                            if gui:IsA("TextLabel") and gui.Visible and string.lower(TrimString(gui.Text)) == "add ingredients" then
-                                popupRoot = gui.Parent
-                                break
-                            end
-                        end
+                        local popupRoot = findAddIngredientsPopup(true)
 
                         if popupRoot then
                             if (_G.PopupAddAttempts or 0) >= 2 then
@@ -2770,14 +2564,7 @@ task.spawn(function()
                         end
                     elseif multiCraftState == "FINISH_CRAFT" then
                         _G.PopupAddAttempts = 0
-                        local popupRoot = nil
-                        local _mUI2 = getCachedMainUI() or playerGui
-                        for _, gui in ipairs(_mUI2:GetDescendants()) do
-                            if gui:IsA("TextLabel") and gui.Visible and string.lower(TrimString(gui.Text)) == "add ingredients" then
-                                popupRoot = gui.Parent
-                                break
-                            end
-                        end
+                        local popupRoot = findAddIngredientsPopup(true)
                         if popupRoot then
                             for _, btn in pairs(popupRoot:GetDescendants()) do
                                 if btn:IsA("GuiButton") and btn.Visible and (string.lower(TrimString(getButtonText(btn))) == "x" or string.lower(TrimString(getButtonText(btn))) == "close") then
@@ -2806,14 +2593,14 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    -- [PERF] รวม 3 for-loop เป็น 1 pass + early-exit เมื่อครบ
+    -- [FIX] 0.4s → 0.5s ลด loop frequency ลงเล็กน้อย
     while task.wait(0.5) do
         if not autoFarmEnabled then
             DetectFish_ON, DetectMinigame_ON, DetectAction_ON = false, false, false
             continue
         end
 
-        local mainUI = getCachedMainUI()
+        local mainUI = playerGui:FindFirstChild("MainInterface")
         if not mainUI then
             DetectFish_ON, DetectMinigame_ON, DetectAction_ON = false, false, false
             continue
@@ -2821,35 +2608,20 @@ task.spawn(function()
         
         local fishOn, miniOn, actOn = false, false, false
 
-        -- Pass 1: ตรวจ Fish + Minigame ใน GetChildren() ครั้งเดียว + early-exit
         for _, child in ipairs(mainUI:GetChildren()) do
             if child:IsA("GuiObject") and child.Visible then
                 local xOff = child.Size.X.Offset
                 local xScl = child.Size.X.Scale
                 local bg = child.BackgroundTransparency
+
                 if math.abs(xOff - 201) <= 2 or math.abs(xScl - 0.122) <= 0.005 then
                     fishOn = (bg <= 0.6)
                 elseif math.abs(xOff - 230) <= 2 or math.abs(xScl - 0.140) <= 0.005 then
                     miniOn = (bg <= 0.6)
-                elseif child:IsA("ImageLabel") then
-                    -- Pass 2 (inline): ตรวจ Action Button ระหว่าง loop เดียวกัน
-                    for _, lv2 in ipairs(child:GetChildren()) do
-                        if lv2:IsA("ImageLabel") then
-                            for _, lv3 in ipairs(lv2:GetChildren()) do
-                                if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
-                                    actOn = true
-                                    break
-                                end
-                            end
-                            if actOn then break end
-                        end
-                    end
                 end
             end
-            if fishOn and miniOn and actOn then break end -- early-exit เมื่อครบทั้งสาม
         end
 
-        -- Fish fallback: ถ้ายังไม่พบผ่าน size-match ให้ลอง cached button
         if not fishOn then
             pcall(function()
                 local btn = getFishButton(mainUI)
@@ -2858,6 +2630,11 @@ task.spawn(function()
                 end
             end)
         end
+
+        pcall(function()
+            local actBtnDetect, _ = findActionBtnFast(mainUI)
+            if actBtnDetect then actOn = true end
+        end)
 
         DetectFish_ON = fishOn
         DetectMinigame_ON = miniOn
@@ -2885,10 +2662,187 @@ local function ClearFishingCache()
     resetAllRecovery()
 end
 
+-- ==========================================
+-- [GLOBAL] ปิด Fish Shop UI อย่างแข็งแรง
+-- Path หลัก: MainInterface.Frame.TextLabel.ImageButton
+-- Path สำรอง: MainInterface.Frame.TextLabel.ImageButton.ImageLabel
+-- ==========================================
+local function closeShopFrameUI()
+    local closed = false
+    pcall(function()
+        local mainUI2 = playerGui:FindFirstChild("MainInterface")
+        if not mainUI2 then return end
+        
+        -- ค้นหา Frame ทุกตัวภายใต้ MainInterface (อาจมีหลาย Frame)
+        for _, f in ipairs(mainUI2:GetChildren()) do
+            if f.Name == "Frame" and f:IsA("GuiObject") then
+                local fOK = false
+                pcall(function() fOK = f.Visible and f.AbsoluteSize.Y > 10 end)
+                if not fOK then continue end
+                
+                -- ตรวจว่ามี TextLabel > ImageButton (path ที่ถูกต้อง)
+                local tl = f:FindFirstChild("TextLabel")
+                if not tl then continue end
+                local ib = tl:FindFirstChild("ImageButton")
+                if not ib then continue end
+                
+                -- เจอ path ที่ถูกต้องแล้ว — กดปิดแบบถี่ ลองทุกวิธี
+                for attempt = 1, 3 do
+                    -- เช็คว่า Frame ยังเปิดอยู่ไหม
+                    local stillOpen = false
+                    pcall(function() stillOpen = f.Visible and f.AbsoluteSize.Y > 10 end)
+                    if not stillOpen then closed = true; return end
+                    
+                    -- กด ImageButton ด้วย fire connections
+                    pcall(function()
+                        if ib and ib.Parent then
+                            forceCraftClick(ib)
+                        end
+                    end)
+                    task.wait(0.12)
+                    
+                    -- กด ImageButton ด้วย mouse/touch sim
+                    pcall(function()
+                        if ib and ib.Parent then
+                            forceFishClick(ib)
+                        end
+                    end)
+                    task.wait(0.15)
+                    
+                    -- เช็คอีกครั้ง
+                    pcall(function() stillOpen = f.Visible and f.AbsoluteSize.Y > 10 end)
+                    if not stillOpen then closed = true; return end
+                    
+                    -- กด ImageLabel (สำรอง) ด้วยทั้ง 2 วิธี
+                    pcall(function()
+                        local il = ib:FindFirstChildWhichIsA("ImageLabel")
+                        if il then
+                            forceCraftClick(il)
+                            task.wait(0.1)
+                            forceFishClick(il)
+                        end
+                    end)
+                    task.wait(0.15)
+                    
+                    -- เช็คอีกครั้ง
+                    pcall(function() stillOpen = f.Visible and f.AbsoluteSize.Y > 10 end)
+                    if not stillOpen then closed = true; return end
+                    
+                    -- Escape key เป็น fallback สุดท้าย
+                    pcall(function()
+                        vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
+                        task.wait(0.08)
+                        vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
+                    end)
+                    task.wait(0.25)
+                end
+                
+                -- เช็คสุดท้ายหลังครบ 3 attempts
+                pcall(function()
+                    if not f.Visible or f.AbsoluteSize.Y <= 10 then closed = true end
+                end)
+                return -- พบ Frame ที่มี path ถูกต้องแล้ว ไม่ต้องหาอีก
+            end
+        end
+    end)
+    return closed
+end
+
+-- [SAFETY] ตรวจ Shop Frame ค้างระหว่างตกปลา ปิดอัตโนมัติ
+task.spawn(function()
+    while task.wait(2) do
+        if not autoFarmEnabled or isSellingProcess then continue end
+        pcall(function()
+            local mainUI2 = playerGui:FindFirstChild("MainInterface")
+            if not mainUI2 then return end
+            for _, f in ipairs(mainUI2:GetChildren()) do
+                if f.Name == "Frame" and f:IsA("GuiObject") then
+                    local fOK = false
+                    pcall(function() fOK = f.Visible and f.AbsoluteSize.Y > 10 end)
+                    if not fOK then continue end
+                    local tl = f:FindFirstChild("TextLabel")
+                    if not tl then continue end
+                    local ib = tl:FindFirstChild("ImageButton")
+                    if not ib then continue end
+                    -- Shop Frame ค้างอยู่ระหว่างตกปลา — ปิดทันที
+                    if FishStatusLabel then FishStatusLabel:SetDesc("Closing stuck Shop UI...") end
+                    closeShopFrameUI()
+                    return
+                end
+            end
+        end)
+    end
+end)
+
+-- [OPT] Shared sell frame finder — ลดโค้ดซ้ำ 2 จุดในขั้นตอนขาย
+local function findSellFrame(mainUI)
+    local sellFrame3, sellScrollFrame, frameDetected = nil, nil, false
+    pcall(function()
+        for _, f1 in ipairs(mainUI:GetChildren()) do
+            if not (f1:IsA("GuiObject") and f1.Visible) then continue end
+            for _, f2 in ipairs(f1:GetChildren()) do
+                if not (f2:IsA("GuiObject") and f2.Visible) then continue end
+                for _, f3 in ipairs(f2:GetChildren()) do
+                    if not (f3:IsA("GuiObject") and f3.Visible) then continue end
+                    local sf = f3:FindFirstChildWhichIsA("ScrollingFrame")
+                    if sf and sf.Visible and #sf:GetChildren() > 0 then
+                        local itemCount = 0
+                        for _, c in ipairs(sf:GetChildren()) do
+                            if not c:IsA("UIListLayout") and not c:IsA("UIGridLayout") and not c:IsA("UIPadding") then
+                                itemCount = itemCount + 1
+                            end
+                        end
+                        if itemCount > 0 then
+                            sellFrame3 = f3
+                            sellScrollFrame = sf
+                            frameDetected = true
+                            return
+                        end
+                    end
+                end
+                if frameDetected then return end
+            end
+            if frameDetected then return end
+        end
+    end)
+    return sellFrame3, sellScrollFrame, frameDetected
+end
+
+-- [OPT] Shared proximity prompt firing helper — ลด Workspace:GetDescendants() ซ้ำ
+local function fireNearbyProximityPrompt(rootPos, maxDist)
+    maxDist = maxDist or 15
+    local promptFired = false
+    pcall(function()
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") then
+                local pp = obj.Parent
+                if pp and pp:IsA("BasePart") and (pp.Position - rootPos).Magnitude <= maxDist then
+                    if fireproximityprompt then
+                        fireproximityprompt(obj, 1)
+                        fireproximityprompt(obj, 0)
+                        promptFired = true
+                        break
+                    end
+                end
+            end
+        end
+    end)
+    if not promptFired then
+        pcall(function()
+            for i = 1, 3 do
+                vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                task.wait(0.1)
+                vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                task.wait(0.15)
+            end
+        end)
+    end
+    return promptFired
+end
+
 task.spawn(function()
     local isWalking = false
-    -- [PERF] 0.25s แทน 0.2s — walking loop ไม่ต้องถี่ขนาดนี้, ประหยัด CPU 20%
-    while task.wait(0.25) do
+    while task.wait(0.2) do
         if not autoFarmEnabled then 
             isAtTarget = false
             isSellingProcess = false
@@ -2909,7 +2863,7 @@ task.spawn(function()
                     hasMinigameMoved = false
                     
                     pcall(function()
-                        local mainUI = getCachedMainUI()
+                        local mainUI = playerGui:FindFirstChild("MainInterface")
                         if mainUI then
                             local extraBtn = getExtraButton(mainUI)
                             if extraBtn and extraBtn.Visible then
@@ -2922,7 +2876,7 @@ task.spawn(function()
 
                     pcall(function()
                         if FishStatusLabel then FishStatusLabel:SetDesc("Preparing to Sell...") end
-                        local mainUI = getCachedMainUI()
+                        local mainUI = playerGui:FindFirstChild("MainInterface")
                         if mainUI then
                             local sideButtons = mainUI:FindFirstChild("SideButtons")
                             if sideButtons then
@@ -2979,34 +2933,8 @@ task.spawn(function()
                     if char:FindFirstChild("Humanoid") then char.Humanoid:MoveTo(root.Position) end
                     task.wait(0.3)
 
-                    -- [FIX] Cache proximity prompt ไว้ เพื่อใช้ปิด Dialog หลัง sell เสร็จ
-                    local cachedSellPrompt = nil
-                    pcall(function()
-                        local promptFired = false
-                        for _, obj in ipairs(Workspace:GetDescendants()) do
-                            if obj:IsA("ProximityPrompt") then
-                                local parentPart = obj.Parent
-                                if parentPart and parentPart:IsA("BasePart") then
-                                    if (parentPart.Position - root.Position).Magnitude <= 15 then
-                                        if fireproximityprompt then
-                                            fireproximityprompt(obj, 1)
-                                            fireproximityprompt(obj, 0)
-                                            cachedSellPrompt = obj  -- cache ไว้ใช้ตอนปิด
-                                            promptFired = true
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                        if not promptFired then
-                            for i = 1, 3 do
-                                vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                                task.wait(0.1)
-                                vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-                                task.wait(0.15)
-                            end
-                        end
-                    end)
+                    -- [OPT] ใช้ shared helper แทน inline prompt search
+                    fireNearbyProximityPrompt(root.Position, 15)
 
                     task.wait(0.8)
                     hasArrivedAtSell = true
@@ -3024,7 +2952,7 @@ task.spawn(function()
                         break
                     end
 
-                    local mainUI = getCachedMainUI()
+                    local mainUI = playerGui:FindFirstChild("MainInterface")
                     if not mainUI then task.wait(0.2); continue end
                     local dialog = mainUI:FindFirstChild("Dialog")
                 
@@ -3064,41 +2992,14 @@ task.spawn(function()
                                 local sellFrame3 = nil
                                 local sellScrollFrame = nil
 
-                                -- [PERF] เพิ่ม wait 0.35 (จาก 0.25) ลดรอบ scan จาก 48 → 34 ครั้ง
-                                -- ตรวจ frame ที่ปรากฏใหม่ใน mainUI แทนการ scan ทั้งหมด
-                                local function findSellScrollFrame()
-                                    for _, f1 in ipairs(mainUI:GetChildren()) do
-                                        if not (f1:IsA("GuiObject") and f1.Visible) then continue end
-                                        for _, f2 in ipairs(f1:GetChildren()) do
-                                            if not (f2:IsA("GuiObject") and f2.Visible) then continue end
-                                            for _, f3 in ipairs(f2:GetChildren()) do
-                                                if not (f3:IsA("GuiObject") and f3.Visible) then continue end
-                                                local sf = f3:FindFirstChildWhichIsA("ScrollingFrame")
-                                                if sf and sf.Visible then
-                                                    local itemCount = 0
-                                                    for _, c in ipairs(sf:GetChildren()) do
-                                                        if not c:IsA("UIListLayout") and not c:IsA("UIGridLayout") and not c:IsA("UIPadding") then
-                                                            itemCount = itemCount + 1
-                                                        end
-                                                    end
-                                                    if itemCount > 0 then
-                                                        sellFrame3 = f3; sellScrollFrame = sf; frameDetected = true; return
-                                                    end
-                                                end
-                                            end
-                                            if frameDetected then return end
-                                        end
-                                        if frameDetected then return end
-                                    end
-                                end
-
                                 while tick() - frameDetectStart < 12 do
-                                    pcall(findSellScrollFrame)
+                                    sellFrame3, sellScrollFrame, frameDetected = findSellFrame(mainUI)
+
                                     if frameDetected then
                                         if FishStatusLabel then FishStatusLabel:SetDesc("Sell Frame Detected! (" .. #sellScrollFrame:GetChildren() .. " items)") end
                                         break
                                     end
-                                    task.wait(0.35)
+                                    task.wait(0.25)
                                 end
 
                                 if not frameDetected then
@@ -3112,34 +3013,7 @@ task.spawn(function()
                                         end
                                     end)
                                     task.wait(1.5)
-                                    pcall(function()
-                                        for _, f1 in ipairs(mainUI:GetChildren()) do
-                                            if not (f1:IsA("GuiObject") and f1.Visible) then continue end
-                                            for _, f2 in ipairs(f1:GetChildren()) do
-                                                if not (f2:IsA("GuiObject") and f2.Visible) then continue end
-                                                for _, f3 in ipairs(f2:GetChildren()) do
-                                                    if not (f3:IsA("GuiObject") and f3.Visible) then continue end
-                                                    local sf = f3:FindFirstChildWhichIsA("ScrollingFrame")
-                                                    if sf and sf.Visible and #sf:GetChildren() > 0 then
-                                                        local itemCount = 0
-                                                        for _, c in ipairs(sf:GetChildren()) do
-                                                            if not c:IsA("UIListLayout") and not c:IsA("UIGridLayout") and not c:IsA("UIPadding") then
-                                                                itemCount = itemCount + 1
-                                                            end
-                                                        end
-                                                        if itemCount > 0 then
-                                                            sellFrame3 = f3
-                                                            sellScrollFrame = sf
-                                                            frameDetected = true
-                                                            return
-                                                        end
-                                                    end
-                                                end
-                                                if frameDetected then return end
-                                            end
-                                            if frameDetected then return end
-                                        end
-                                    end)
+                                    sellFrame3, sellScrollFrame, frameDetected = findSellFrame(mainUI)
                                     if not frameDetected then
                                         if FishStatusLabel then FishStatusLabel:SetDesc("No Sell Frame. Skipping...") end
                                         break
@@ -3153,6 +3027,7 @@ task.spawn(function()
                                 local emptyBagCheck = 0
                                 local innerLoopStart = tick()
                                 local sellAllMissCount = 0
+                                local cachedSellAllBtn = nil -- [OPT] cache Sell All button
                                 while autoFarmEnabled and isSellingProcess do
                                     if tick() - innerLoopStart > 120 then
                                         if FishStatusLabel then FishStatusLabel:SetDesc("Bag Timeout! Exiting...") end
@@ -3172,15 +3047,10 @@ task.spawn(function()
                                         end)
                                     end
                                     if not scrollFrame then
-                                        -- [PERF] scan 3 levels แทน GetDescendants()
                                         pcall(function()
-                                            for _, c1 in ipairs(mainUI:GetChildren()) do
-                                                if c1:IsA("ScrollingFrame") and c1.Visible and #c1:GetChildren() > 0 then scrollFrame = c1; return end
-                                                for _, c2 in ipairs(c1:GetChildren()) do
-                                                    if c2:IsA("ScrollingFrame") and c2.Visible and #c2:GetChildren() > 0 then scrollFrame = c2; return end
-                                                    for _, c3 in ipairs(c2:GetChildren()) do
-                                                        if c3:IsA("ScrollingFrame") and c3.Visible and #c3:GetChildren() > 0 then scrollFrame = c3; return end
-                                                    end
+                                            for _, desc in ipairs(mainUI:GetDescendants()) do
+                                                if desc:IsA("ScrollingFrame") and desc.Visible and #desc:GetChildren() > 0 then
+                                                    scrollFrame = desc; break
                                                 end
                                             end
                                         end)
@@ -3212,100 +3082,79 @@ task.spawn(function()
                                             task.wait(0.4)
 
                                             if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Sell All...") end
+                                            -- [OPT] Cache sell all button — ลดการ search ซ้ำทุกรอบ
                                             local sellAllBtn = nil
-                                            pcall(function()
-                                                for _, f1 in ipairs(mainUI:GetChildren()) do
-                                                    if not (f1:IsA("GuiObject") and f1.Visible) then continue end
-                                                    for _, f2 in ipairs(f1:GetChildren()) do
-                                                        if not (f2:IsA("GuiObject") and f2.Visible) then continue end
-                                                        for _, imgBtn in ipairs(f2:GetChildren()) do
-                                                            if imgBtn:IsA("ImageButton") and imgBtn.Visible then
-                                                                local tl = imgBtn:FindFirstChildWhichIsA("TextLabel")
-                                                                if tl then
-                                                                    local txt = tl.Text:lower()
-                                                                    if txt:match("sell all") or txt:match("ขายทั้งหมด") then
-                                                                        sellAllBtn = imgBtn; return
+                                            if cachedSellAllBtn and cachedSellAllBtn.Parent and cachedSellAllBtn.Visible then
+                                                sellAllBtn = cachedSellAllBtn
+                                            else
+                                                cachedSellAllBtn = nil
+                                                pcall(function()
+                                                    for _, f1 in ipairs(mainUI:GetChildren()) do
+                                                        if not (f1:IsA("GuiObject") and f1.Visible) then continue end
+                                                        for _, f2 in ipairs(f1:GetChildren()) do
+                                                            if not (f2:IsA("GuiObject") and f2.Visible) then continue end
+                                                            for _, imgBtn in ipairs(f2:GetChildren()) do
+                                                                if imgBtn:IsA("ImageButton") and imgBtn.Visible then
+                                                                    local tl = imgBtn:FindFirstChildWhichIsA("TextLabel")
+                                                                    if tl then
+                                                                        local txt = tl.Text:lower()
+                                                                        if txt:match("sell all") or txt:match("ขายทั้งหมด") then
+                                                                            sellAllBtn = imgBtn; cachedSellAllBtn = imgBtn; return
+                                                                        end
+                                                                    end
+                                                                    local n = imgBtn.Name:lower()
+                                                                    if n:match("sell") or n:match("sellall") then
+                                                                        sellAllBtn = imgBtn; cachedSellAllBtn = imgBtn; return
                                                                     end
                                                                 end
-                                                                local n = imgBtn.Name:lower()
-                                                                if n:match("sell") or n:match("sellall") then
-                                                                    sellAllBtn = imgBtn; return
-                                                                end
                                                             end
+                                                            if sellAllBtn then return end
                                                         end
                                                         if sellAllBtn then return end
-                                                    end
-                                                    if sellAllBtn then return end
-                                                end
-                                            end)
-                                            if not sellAllBtn then
-                                                -- [PERF] scan 3 levels แทน GetDescendants()
-                                                pcall(function()
-                                                    local function trySellAll(node)
-                                                        if not node.Visible then return end
-                                                        local txt = nil
-                                                        if node:IsA("TextLabel") or node:IsA("TextButton") then txt = node.Text:lower() end
-                                                        if txt and txt:match("sell all") then
-                                                            if node:IsA("GuiButton") or node:IsA("ImageButton") then sellAllBtn = node
-                                                            elseif node.Parent and (node.Parent:IsA("GuiButton") or node.Parent:IsA("ImageButton")) then sellAllBtn = node.Parent end
-                                                        end
-                                                    end
-                                                    for _, c1 in ipairs(mainUI:GetChildren()) do
-                                                        trySellAll(c1); if sellAllBtn then return end
-                                                        for _, c2 in ipairs(c1:GetChildren()) do
-                                                            trySellAll(c2); if sellAllBtn then return end
-                                                            for _, c3 in ipairs(c2:GetChildren()) do
-                                                                trySellAll(c3); if sellAllBtn then return end
-                                                            end
-                                                        end
                                                     end
                                                 end)
                                             end
 
                                             if sellAllBtn then
                                                 sellAllMissCount = 0
-                                                task.wait(0.2)
-                                                -- [VERIFY] กด SellAll แล้วเช็คว่า popup ขึ้นมาไหม
-                                                clickVerified(sellAllBtn, forceCraftClick, 3, 0.08)
-                                                task.wait(0.5)
+                                                task.wait(0.3)
+                                                forceCraftClick(sellAllBtn)
+                                                task.wait(0.8)
 
+                                                -- [OPT] ค้นหา Sell Confirm popup แบบ targeted
+                                                -- แทนที่จะ scan GetDescendants ทุกรอบ ค้นหาแค่ children ลึก 3 ชั้น
                                                 local targetConfirmBtn = nil
-                                                -- [PERF] scan 3 levels หา "Sell Confirm" popup แทน GetDescendants()
                                                 pcall(function()
-                                                    local function findSellConfirm(node)
-                                                        if node:IsA("TextLabel") and node.Text == "Sell Confirm" and node.Visible then
-                                                            local pf = node.Parent
-                                                            if pf and pf:IsA("GuiObject") then
-                                                                for _, pd in ipairs(pf:GetDescendants()) do
-                                                                    if pd:IsA("TextLabel") and pd.Text == "Sell" and pd.Visible then
-                                                                        local b = pd.Parent
-                                                                        if b and (b:IsA("GuiButton") or b:IsA("ImageButton")) and b.Visible then
-                                                                            targetConfirmBtn = b; return
+                                                    for _, f1 in ipairs(mainUI:GetChildren()) do
+                                                        if not (f1:IsA("GuiObject") and f1.Visible) then continue end
+                                                        for _, desc in ipairs(f1:GetDescendants()) do
+                                                            if desc:IsA("TextLabel") and desc.Text == "Sell Confirm" and desc.Visible then
+                                                                local popupFrame = desc.Parent
+                                                                if popupFrame and popupFrame:IsA("GuiObject") then
+                                                                    for _, pDesc in ipairs(popupFrame:GetDescendants()) do
+                                                                        if pDesc:IsA("TextLabel") and pDesc.Text == "Sell" and pDesc.Visible then
+                                                                            local button = pDesc.Parent
+                                                                            if button and (button:IsA("GuiButton") or button:IsA("ImageButton")) and button.Visible then
+                                                                                targetConfirmBtn = button
+                                                                                return
+                                                                            end
                                                                         end
                                                                     end
                                                                 end
                                                             end
                                                         end
-                                                    end
-                                                    for _, c1 in ipairs(mainUI:GetChildren()) do
-                                                        findSellConfirm(c1); if targetConfirmBtn then return end
-                                                        for _, c2 in ipairs(c1:GetChildren()) do
-                                                            findSellConfirm(c2); if targetConfirmBtn then return end
-                                                            for _, c3 in ipairs(c2:GetChildren()) do
-                                                                findSellConfirm(c3); if targetConfirmBtn then return end
-                                                            end
-                                                        end
+                                                        if targetConfirmBtn then return end
                                                     end
                                                 end)
 
                                                 if targetConfirmBtn then
-                                                    -- [VERIFY] กด Confirm แล้วเช็คว่าหายไหม
-                                                    clickVerified(targetConfirmBtn, forceCraftClick, 3, 0.08)
-                                                    task.wait(0.5)
+                                                    task.wait(0.3)
+                                                    forceCraftClick(targetConfirmBtn)
+                                                    task.wait(0.8)
                                                     sellAllMissCount = 0
                                                     if FishStatusLabel then FishStatusLabel:SetDesc("Sold Item! Checking for more...") end
                                                 else
-                                                    task.wait(0.2)
+                                                    task.wait(0.3)
                                                 end
                                             else
                                                 sellAllMissCount = sellAllMissCount + 1
@@ -3330,98 +3179,15 @@ task.spawn(function()
                                 end
                                 -- ==========================================
 
-                                if FishStatusLabel then FishStatusLabel:SetDesc("Closing UI...") end
-                                pcall(function()
-                                    -- ==========================================
-                                    -- ปิด Sell UI — 3 วิธีเรียงลำดับ
-                                    -- ==========================================
+                                if FishStatusLabel then FishStatusLabel:SetDesc("Closing Shop UI...") end
+                                closeShopFrameUI()
+                                task.wait(0.3)
 
-                                    -- วิธี 1: path ตายตัว MainInterface.Frame.TextLabel.ImageButton
-                                    -- (สำรอง) กด ImageLabel ลูกของ ImageButton ในกรณีที่ ImageButton เองรับ click ไม่ได้
-                                    local targetCloseBtn = nil
-                                    local targetCloseFallback = nil  -- ImageLabel สำรอง
-                                    for _, frameNode in ipairs(mainUI:GetChildren()) do
-                                        if frameNode.Name == "Frame" and frameNode.Visible then
-                                            local textLabel = frameNode:FindFirstChild("TextLabel")
-                                            if textLabel then
-                                                local imgBtn = textLabel:FindFirstChild("ImageButton")
-                                                if imgBtn and imgBtn.Visible then
-                                                    targetCloseBtn = imgBtn
-                                                    -- [FIX] เก็บ ImageLabel ลูกเป็น fallback สำหรับกรณีกดพลาด
-                                                    -- Path สำรอง: MainInterface.Frame.TextLabel.ImageButton.ImageLabel
-                                                    local imgLbl = imgBtn:FindFirstChildWhichIsA("ImageLabel")
-                                                    if imgLbl and imgLbl.Visible then
-                                                        targetCloseFallback = imgLbl
-                                                    end
-                                                    break
-                                                end
-                                            end
-                                        end
-                                    end
-
-                                    -- วิธี 2 (fallback): หา X/Close text 3 levels deep
-                                    if not targetCloseBtn then
-                                        -- [PERF] scan 3 levels แทน GetDescendants()
-                                        for _, c1 in ipairs(mainUI:GetChildren()) do
-                                            local function tryClose(node)
-                                                if (node:IsA("TextLabel") or node:IsA("TextButton")) and node.Visible then
-                                                    local t = node.Text:lower()
-                                                    if t == "x" or t == "close" then
-                                                        local b = node:IsA("GuiButton") and node or node.Parent
-                                                        if b and b:IsA("GuiButton") then targetCloseBtn = b end
-                                                    end
-                                                end
-                                            end
-                                            tryClose(c1); if targetCloseBtn then break end
-                                            for _, c2 in ipairs(c1:GetChildren()) do
-                                                tryClose(c2); if targetCloseBtn then break end
-                                                for _, c3 in ipairs(c2:GetChildren()) do
-                                                    tryClose(c3); if targetCloseBtn then break end
-                                                end
-                                                if targetCloseBtn then break end
-                                            end
-                                            if targetCloseBtn then break end
-                                        end
-                                    end
-
-                                    if targetCloseBtn then
-                                        -- กด ImageButton หลักก่อน
-                                        forceCraftClick(targetCloseBtn)
-                                        task.wait(0.25)
-
-                                        -- ตรวจว่าปิดแล้วหรือยัง
-                                        local stillOpen = false
-                                        pcall(function()
-                                            stillOpen = targetCloseBtn.Visible and targetCloseBtn.AbsoluteSize.X > 0
-                                        end)
-
-                                        -- [FIX] ถ้ายังไม่ปิด ลอง ImageLabel สำรองก่อน (กดพลาด path)
-                                        if stillOpen and targetCloseFallback then
-                                            forceCraftClick(targetCloseFallback)
-                                            task.wait(0.25)
-                                        elseif stillOpen then
-                                            -- กด ImageButton ซ้ำอีกครั้ง
-                                            forceCraftClick(targetCloseBtn)
-                                            task.wait(0.25)
-                                        end
-                                    end
-
-                                    -- วิธี 3: ถ้าปิดไม่ได้เลย กด Escape — ทุก UI ปิดได้ด้วย Escape
-                                    local dlgBack = mainUI:FindFirstChild("Dialog")
-                                    local shopStillOpen = not (dlgBack and dlgBack.Visible)
-                                    if shopStillOpen then
-                                        vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
-                                        task.wait(0.15)
-                                        vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
-                                        task.wait(0.3)
-                                    end
-                                end)
-                                
                                 hasCompletedSell = true
                                 totalSellCount = totalSellCount + 1
                                 task.wait(0.5)
 
-                                -- [FIX] กด Leave (choice ตัวที่ 3) เพื่อปิด Dialog NPC หลังปิด Sell UI
+                                -- กด Leave (choice ตัวที่ 3) เพื่อปิด Dialog NPC หลังปิด Sell UI
                                 task.wait(0.3)
                                 pcall(function()
                                     local dlg2 = mainUI:FindFirstChild("Dialog")
@@ -3440,9 +3206,6 @@ task.spawn(function()
                                     local leaveBtn2 = btns2[3] or btns2[#btns2]
                                     if leaveBtn2 then forceCraftClick(leaveBtn2) end
                                 end)
-                                forceCraftClick(validChoices[#validChoices])
-                                hasCompletedSell = true
-                                totalSellCount = totalSellCount + 1
                                 task.wait(0.5)
                             end
                         else
@@ -3457,28 +3220,7 @@ task.spawn(function()
                             local char2 = player.Character
                             local root2 = char2 and char2:FindFirstChild("HumanoidRootPart")
                             if not root2 then return end
-                            local promptFired2 = false
-                            for _, obj in ipairs(Workspace:GetDescendants()) do
-                                if obj:IsA("ProximityPrompt") then
-                                    local pp = obj.Parent
-                                    if pp and pp:IsA("BasePart") and (pp.Position - root2.Position).Magnitude <= 15 then
-                                        if fireproximityprompt then
-                                            fireproximityprompt(obj, 1)
-                                            task.wait(0.05)
-                                            fireproximityprompt(obj, 0)
-                                            promptFired2 = true
-                                        end
-                                    end
-                                end
-                            end
-                            if not promptFired2 then
-                                for i = 1, 3 do
-                                    vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
-                                    task.wait(0.1)
-                                    vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-                                    task.wait(0.15)
-                                end
-                            end
+                            fireNearbyProximityPrompt(root2.Position, 15)
                         end)
                         task.wait(0.8)
 
@@ -3500,13 +3242,17 @@ task.spawn(function()
                 fishingRoundCount = 0
 
                 if FishBagLabel then FishBagLabel:SetDesc("Rounds: " .. fishingRoundCount .. " / " .. targetFishCount) end
-                if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Closing Dialog...") end
+                if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Closing Shop...") end
+
+                -- [FIXED] ปิด Shop Frame UI จากทุก exit path (ใช้ global function)
+                closeShopFrameUI()
+                task.wait(0.3)
 
                 -- [FIX] ปิด Dialog NPC หลัง sell เสร็จ
                 -- path ตายตัว: MainInterface.Dialog.Choices → 3 children = [Open Shop, Sell Fish, Leave]
                 -- Leave อยู่ตัวที่ 3 เสมอ แต่ต้อง sort ด้วย LayoutOrder ก่อน เพราะ GetChildren() ไม่การันตีลำดับ
                 local function closeDialogSafely()
-                    local mainUI2 = getCachedMainUI()
+                    local mainUI2 = playerGui:FindFirstChild("MainInterface")
                     if not mainUI2 then return end
                     local dlg = mainUI2:FindFirstChild("Dialog")
                     if not (dlg and dlg.Visible) then return end
@@ -3519,27 +3265,36 @@ task.spawn(function()
                             table.insert(btns, child)
                         end
                     end
+                    -- sort ด้วย LayoutOrder เพื่อให้ลำดับถูกต้อง
                     table.sort(btns, function(a, b)
                         return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
                     end)
-                    local leaveBtn = #btns >= 3 and btns[3] or btns[#btns]
-                    if leaveBtn then
-                        -- [VERIFY] กด Leave แล้วเช็คว่า Dialog หายไหม
-                        clickVerified(leaveBtn, forceCraftClick, 3, 0.08)
-                        task.wait(0.2)
+                    -- Leave = ตัวที่ 3 (index สุดท้าย)
+                    if #btns >= 3 then
+                        forceCraftClick(btns[3])
+                        task.wait(0.3)
+                    elseif #btns > 0 then
+                        forceCraftClick(btns[#btns])
+                        task.wait(0.3)
                     end
                 end
 
                 closeDialogSafely()
 
+                -- [FIX] รอให้ Dialog หายจริงๆ ก่อนเดินกลับ (timeout 3 วินาที)
+                -- ถ้าไม่รอ ตอนถึง fishing spot แล้วกด Fish button ไปโดน Dialog แทน
                 local dialogWaitStart = tick()
                 while tick() - dialogWaitStart < 3 do
-                    local mainUI = getCachedMainUI()
+                    local mainUI = playerGui:FindFirstChild("MainInterface")
                     local dlg = mainUI and mainUI:FindFirstChild("Dialog")
                     if not dlg or not dlg.Visible then break end
+                    -- Dialog ยังอยู่ ลองปิดอีกครั้ง
                     closeDialogSafely()
                     task.wait(0.3)
                 end
+                
+                -- Safety: ลองปิด Shop Frame อีกครั้งสุดท้ายก่อนเดินกลับ
+                closeShopFrameUI()
 
                 ClearFishingCache()
                 task.wait(0.3)
@@ -3599,14 +3354,15 @@ local function setFishStatus(txt)
     end
 end
 
--- [PERF] 0.07s แทน 0.05s = 14x/วินาที (ยังเร็วพอสำหรับ minigame, กิน CPU น้อยลง 28%)
--- เพิ่ม early-exit เมื่อ autoFarm ปิดหรือ selling — ไม่ต้อง check flag ใน pcall ทุกรอบ
-task.spawn(function() while task.wait(0.07) do
+-- [FIX] เปลี่ยน Heartbeat → task.wait(0.05) loop
+-- Heartbeat ยิง 60 ครั้ง/วินาที, scan UI + GetDescendants ทุก frame ทำให้มือถือ FPS ตก
+-- 0.05s = 20 ครั้ง/วินาที เร็วพอสำหรับ minigame แต่ไม่กิน CPU มากเกิน
+task.spawn(function() while task.wait(0.05) do
     if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI or not DetectMinigame_ON then
         if isMinigameActive then
             isMinigameActive = false
         end
-        continue
+        continue  -- [FIX] ใช้ continue แทน return เพราะอยู่ใน while loop
     end
 
     pcall(function()
@@ -3680,7 +3436,7 @@ task.spawn(function()
         end
 
         pcall(function()
-            local mainUI = getCachedMainUI()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
             if not mainUI then return end
 
             local childCount = #mainUI:GetChildren()
@@ -3706,23 +3462,7 @@ task.spawn(function()
             local actionContainer = nil
             local extraBtn = nil
             if DetectAction_ON then
-                pcall(function()
-                    for _, lv1 in ipairs(mainUI:GetChildren()) do
-                        if lv1:IsA("ImageLabel") then
-                            for _, lv2 in ipairs(lv1:GetChildren()) do
-                                if lv2:IsA("ImageLabel") then
-                                    for _, lv3 in ipairs(lv2:GetChildren()) do
-                                        if lv3:IsA("ImageButton") and lv3.Visible and lv3.AbsoluteSize.X > 0 then
-                                            actionContainer = lv2
-                                            extraBtn = lv3
-                                            return
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end)
+                extraBtn, actionContainer = findActionBtnFast(mainUI)
                 if not extraBtn then
                     extraBtn = getExtraButton(mainUI)
                 end
@@ -3736,12 +3476,21 @@ task.spawn(function()
 
             local isActionAnimDone = true
             if actionContainer then
-                -- _actionBGSample is now a local upvalue
-                local key = tostring(actionContainer)
-                local prev = _actionBGSample[key]
+                if not _G._actionBGSample then _G._actionBGSample = {} end
+                -- [FIX] ใช้ key เดียว "cur" แทน tostring(container)
+                -- เดิม tostring สร้าง key ใหม่ทุกรอบที่ container ถูก recreate → สะสมไม่มีวันถูกลบ → แลคระยะยาว
+                local prev = _G._actionBGSample["cur_bg"]
+                local prevKey = _G._actionBGSample["cur_key"]
+                local curKey = tostring(actionContainer)
                 local curBG = actionContainer.BackgroundTransparency
-                isActionAnimDone = prev and math.abs(curBG - prev) < 0.05 or false
-                _actionBGSample[key] = curBG
+                -- ถ้า container เปลี่ยน reset sample
+                if prevKey ~= curKey then
+                    _G._actionBGSample = { cur_key = curKey, cur_bg = curBG }
+                    isActionAnimDone = false
+                else
+                    isActionAnimDone = prev and math.abs(curBG - prev) < 0.05 or false
+                    _G._actionBGSample["cur_bg"] = curBG
+                end
             end
 
             local timeInStep = tick() - lastFishingStepTime
@@ -3749,6 +3498,26 @@ task.spawn(function()
             -- ===== STEP 0: รอปุ่ม Fish =====
             if fishingStep == 0 then
                 resetRecovery(0)
+
+                -- [FIXED] ตรวจ Shop Frame ค้างก่อนทุกอย่าง — ถ้าเปิดอยู่จะบัง Fish button
+                pcall(function()
+                    for _, f in ipairs(mainUI:GetChildren()) do
+                        if f.Name == "Frame" and f:IsA("GuiObject") then
+                            local fOK = false
+                            pcall(function() fOK = f.Visible and f.AbsoluteSize.Y > 10 end)
+                            if not fOK then continue end
+                            local tl = f:FindFirstChild("TextLabel")
+                            if not tl then continue end
+                            if tl:FindFirstChild("ImageButton") then
+                                if FishStatusLabel then FishStatusLabel:SetDesc("Closing Shop Frame...") end
+                                closeShopFrameUI()
+                                task.wait(0.3)
+                                lastFishingStepTime = tick()
+                                return
+                            end
+                        end
+                    end
+                end)
 
                 -- [FIX] ตรวจ Dialog NPC ค้างก่อนทุกอย่าง กด Leave (choice[3]) เพื่อปิด
                 pcall(function()
@@ -3783,11 +3552,14 @@ task.spawn(function()
                     local freshBtn = getFishButton(mainUI)
                     if not freshBtn then return end
 
-                    -- [VERIFY] กดแล้วเช็คเลยว่าติดไหม retry อัตโนมัติ ไม่รอ 0.4s เปล่าๆ
-                    local clickedOK = clickVerified(freshBtn, forceFishClick, 3, 0.08, function(btn)
-                        local vis, bg = true, 0
-                        pcall(function() vis = btn.Visible; bg = btn.BackgroundTransparency end)
-                        return (not vis) or (bg >= 0.9)
+                    forceFishClick(freshBtn)
+                    task.wait(0.4)
+
+                    local clickedOK = false
+                    pcall(function()
+                        local stillVisible = freshBtn.Visible
+                        local bg = freshBtn.BackgroundTransparency
+                        clickedOK = (not stillVisible) or (bg >= 0.9)
                     end)
 
                     if clickedOK then
@@ -3795,8 +3567,18 @@ task.spawn(function()
                         fishingStep = 1
                         lastFishingStepTime = tick()
                     else
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Fish Click Failed — Retrying...") end
-                        cachedFishBtn = nil
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Retrying Fish Click...") end
+                        forceFishClick(freshBtn)
+                        task.wait(0.4)
+                        local retryOK = false
+                        pcall(function()
+                            retryOK = (not freshBtn.Visible) or (freshBtn.BackgroundTransparency >= 0.9)
+                        end)
+                        if retryOK then
+                            fishingStep = 1
+                        else
+                            cachedFishBtn = nil
+                        end
                         lastFishingStepTime = tick()
                     end
 
@@ -3925,106 +3707,74 @@ task.spawn(function()
                         isPositionReady = xScaleOK and xOffOK and yOK
                     end)
 
-                    -- ป้องกันกดปุ่มก่อน Animation เสร็จ
+                    -- [FIX] เพิ่ม isActionAnimDone ในเงื่อนไข ป้องกันกดปุ่มก่อน Animation เสร็จ
                     if isPositionReady and isActionAnimDone then
                         if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Action...") end
 
-                        -- ==========================================
-                        -- [VERIFY] Action Button — ใช้ clickVerified loop
-                        -- เช็คทุก 0.08s ว่าปุ่มหายหรือยัง retry จน timeout 8s
-                        -- ==========================================
-                        local isMainClickActive = true
+                        -- [ADD] Parallel loop: กดทุก 1 วินาที กันแลค/กดพลาด
                         local actionClickActive = true
-
-                        -- Custom check สำหรับ Action Button:
-                        -- ปุ่มยังอยู่ถ้า position ยัง in-place, Visible, size > 0
-                        local function actionBtnGone(btn)
-                            if not btn or not btn.Parent then return true end
-                            if not btn.Visible or btn.AbsoluteSize.X <= 0 then return true end
-                            local pos = btn.Position
-                            local inPos = math.abs(pos.X.Scale - 1) < 0.05
-                                       and math.abs(pos.X.Offset) < 5
-                                       and math.abs(pos.Y.Scale) < 0.05
-                                       and math.abs(pos.Y.Offset) < 5
-                            return not inPos -- หายถ้า position เลื่อนออกไป
-                        end
-
-                        -- safety-net parallel: กดซ้ำถ้า main หยุดแต่ปุ่มยังอยู่
                         task.spawn(function()
-                            task.wait(1.5)
                             while actionClickActive do
-                                if not isMainClickActive then
-                                    pcall(function()
-                                        if extraBtn and not actionBtnGone(extraBtn) then
-                                            forceActionClick(extraBtn)
-                                        end
-                                    end)
-                                end
-                                task.wait(1.2)
+                                pcall(function()
+                                    local pos = extraBtn.Position
+                                    local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
+                                    local xOffOK   = math.abs(pos.X.Offset)    < 5
+                                    local yOK      = math.abs(pos.Y.Scale)      < 0.05
+                                                  and math.abs(pos.Y.Offset)    < 5
+                                    local inPos = xScaleOK and xOffOK and yOK and extraBtn.Visible
+                                    if inPos then
+                                        forceFishClick(extraBtn)
+                                    end
+                                end)
+                                task.wait(1.0)
                             end
                         end)
 
-                        -- Main loop: clickVerified ทุก 0.08s สูงสุด 10 ครั้ง (~8s)
-                        local actionDone = false
-                        local actionTimeout = tick()
-                        while tick() - actionTimeout < 8 do
-                            -- เช็คก่อนกดว่าปุ่มยังอยู่ไหม
-                            if actionBtnGone(extraBtn) then
-                                actionDone = true
-                                if FishStatusLabel then FishStatusLabel:SetDesc("Action Completed!") end
-                                break
-                            end
-                            -- กดแล้วเช็คเลย
-                            local hit = clickVerified(extraBtn, forceActionClick, 1, 0.08, function(btn)
-                                return actionBtnGone(btn)
+                        -- ระบบเดิม: กดแบบ loop จำกัด attempt (ยังคงอยู่)
+                        local maxAttempts = 10
+                        for i = 1, maxAttempts do
+                            local stillReady = false
+                            pcall(function()
+                                local pos = extraBtn.Position
+                                local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
+                                local xOffOK   = math.abs(pos.X.Offset)    < 5
+                                local yOK      = math.abs(pos.Y.Scale)      < 0.05
+                                              and math.abs(pos.Y.Offset)    < 5
+                                stillReady = xScaleOK and xOffOK and yOK and extraBtn.Visible
                             end)
-                            if hit then
-                                actionDone = true
+
+                            if not stillReady then
                                 if FishStatusLabel then FishStatusLabel:SetDesc("Action Completed!") end
                                 break
                             end
-                            if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Action...") end
-                            task.wait(0.4) -- รอ animation ก่อน retry
+
+                            forceFishClick(extraBtn)
+                            if FishStatusLabel then FishStatusLabel:SetDesc(string.format("Clicking Action... (%d/%d)", i, maxAttempts)) end
+                            task.wait(0.5)
                         end
 
-                        isMainClickActive = false
+                        -- หยุด parallel loop เมื่อ main loop จบ
                         actionClickActive = false
 
-                        -- ==========================================
-                        -- [VERIFY] Confirm Button — clickVerified 3 ครั้ง
-                        -- ลอง ImageButton → ImageLabel → parent ตามลำดับ
-                        -- ==========================================
-                        task.wait(0.3)
+                        task.wait(0.5)
                         local confirmBtn = nil
                         pcall(function()
                             for _, child in ipairs(extraBtn:GetChildren()) do
-                                if child:IsA("ImageButton") and child.Visible and child.AbsoluteSize.X > 0 then
-                                    confirmBtn = child; return
-                                end
-                            end
-                            for _, child in ipairs(extraBtn:GetChildren()) do
-                                if child:IsA("ImageLabel") and child.Visible and child.AbsoluteSize.X > 0 then
-                                    confirmBtn = child; return
-                                end
-                            end
-                            for _, desc in ipairs(extraBtn:GetDescendants()) do
-                                if (desc:IsA("ImageButton") or desc:IsA("GuiButton")) and desc.Visible and desc.AbsoluteSize.X > 0 then
-                                    confirmBtn = desc; return
+                                if child:IsA("ImageLabel") and child.Visible then
+                                    confirmBtn = child
+                                    break
                                 end
                             end
                         end)
-
                         if confirmBtn then
                             if FishStatusLabel then FishStatusLabel:SetDesc("Confirming Action...") end
-                            -- clickVerified: 3 attempts, เช็คทุก 0.08s
-                            -- ถ้ายังไม่หาย ลอง parent ด้วย
-                            local confirmed = clickVerified(confirmBtn, forceActionClick, 3, 0.08)
-                            if not confirmed then
-                                -- fallback: ลอง parent
-                                local parentBtn = confirmBtn.Parent
-                                if parentBtn and (parentBtn:IsA("GuiButton") or parentBtn:IsA("ImageButton")) then
-                                    clickVerified(parentBtn, forceActionClick, 2, 0.08)
-                                end
+                            forceFishClick(confirmBtn)
+                            task.wait(0.3)
+                            local stillHere = false
+                            pcall(function() stillHere = confirmBtn.Visible and confirmBtn.AbsoluteSize.X > 0 end)
+                            if stillHere then
+                                forceFishClick(confirmBtn)
+                                task.wait(0.2)
                             end
                         end
 
@@ -4039,7 +3789,7 @@ task.spawn(function()
                         actionFirstDetected = 0
                         resetAllRecovery()
                         cachedExtraBtn = nil
-                        table.clear(_actionBGSample)
+                        if _G._actionBGSample then _G._actionBGSample = {} end
 
                     else
                         if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for UI Animation...") end
@@ -4062,9 +3812,9 @@ task.spawn(function()
                             cachedExtraBtn = nil
                             local freshExtra = getExtraButton(mainUI)
                             if freshExtra and freshExtra.Visible then
-                                forceActionClick(freshExtra)
-                                task.wait(0.35)
-                                forceActionClick(freshExtra)
+                                forceFishClick(freshExtra)
+                                task.wait(0.3)
+                                forceFishClick(freshExtra)
                             else
                                 clickOnce()
                             end
@@ -4073,9 +3823,10 @@ task.spawn(function()
                         elseif rec.layer == 1 and tick() - rec.time > 4.0 then
                             if FishStatusLabel then FishStatusLabel:SetDesc("Skipping Action Step...") end
                             ClearFishingCache()
-                            table.clear(_actionBGSample)
+                            -- [FIX] ล้าง actionBGSample ตอน skip ด้วย ป้องกัน memory accumulate
+                            if _G._actionBGSample then _G._actionBGSample = {} end
                             local fallbackExtra = getExtraButton(mainUI)
-                            if fallbackExtra then forceActionClick(fallbackExtra)
+                            if fallbackExtra then forceFishClick(fallbackExtra)
                             else clickOnce() end
                             task.wait(0.5)
                             fishingRoundCount = fishingRoundCount + 1
