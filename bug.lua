@@ -415,7 +415,7 @@ local function SendMerchantWebhook(entityName, isTestMessage, isDespawn)
                 {name = "NPC Name", value = "```" .. entityName .. "```", inline = true},
                 {name = "Current Biome", value = "```" .. CurrentBiomeCache .. "```", inline = false}
             },
-            footer = {text = "XT-HUB [BETA]"}
+            footer = {text = "XT-HUB [1.3]"}
         }}
     }
     
@@ -623,6 +623,7 @@ end
 
 -- ==========================================
 -- 1. ฟังก์ชันคลิกสำหรับ UI ทั่วไป และ Auto Craft
+-- [FIX] เพิ่ม screen bounds guard, ลบ task.spawn (ป้องกัน coroutine stack)
 -- ==========================================
 local function forceCraftClick(element)
     if not element then return false end
@@ -640,27 +641,34 @@ local function forceCraftClick(element)
         end
     end)
 
-    pcall(function()
-        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
-        if absSize.X > 0 and absSize.Y > 0 then
-            local inset, _ = guiService:GetGuiInset()
-            local clickX = absPos.X + (absSize.X / 2)
-            local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-            
-            task.spawn(function()
-                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
-                task.wait(0.05)
-                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
-            end)
-            successClicked = true
-        end
-    end)
+    if not successClicked then
+        pcall(function()
+            local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+            if absSize.X > 0 and absSize.Y > 0 then
+                local inset, _ = guiService:GetGuiInset()
+                local clickX = absPos.X + (absSize.X / 2)
+                local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
+                -- [FIX] เช็ค screen bounds ป้องกันคลิกผิด UI
+                local vp = camera.ViewportSize
+                if clickX > 0 and clickY > 0 and clickX < vp.X and clickY < vp.Y then
+                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                    task.wait(0.05)
+                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+                    successClicked = true
+                end
+            end
+        end)
+    end
     
     return successClicked
 end
 
 -- ==========================================
 -- 2. ฟังก์ชันคลิกเฉพาะหน้าจอ / ปุ่มสำหรับการตกปลา
+-- [FIX] ลบ SendTouchEvent ซ้อน (ทำให้คลิกโดน UI 2 ครั้ง)
+-- [FIX] ลบ task.spawn (ป้องกัน coroutine stack up)
+-- [FIX] เพิ่ม screen bounds guard (ป้องกันคลิกนอกจอ)
+-- [FIX] fire connection ก่อน ถ้าสำเร็จแล้วไม่ต้อง SendMouseEvent
 -- ==========================================
 local function forceFishClick(element)
     if not element then return false end
@@ -673,34 +681,34 @@ local function forceFishClick(element)
         end
         if getconnections and button:IsA("GuiButton") then
             local clickConns = getconnections(button.MouseButton1Click)
-            for _, conn in ipairs(clickConns) do pcall(function() conn:Fire() end) end
             local activatedConns = getconnections(button.Activated)
+            for _, conn in ipairs(clickConns) do pcall(function() conn:Fire() end) end
             for _, conn in ipairs(activatedConns) do pcall(function() conn:Fire() end) end
-            if (#clickConns > 0 or #activatedConns > 0) then
+            if #clickConns > 0 or #activatedConns > 0 then
                 successClicked = true
             end
         end
     end)
 
-    pcall(function()
-        local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
-        if absSize.X > 0 and absSize.Y > 0 then
-            local inset, _ = guiService:GetGuiInset()
-            local clickX = absPos.X + (absSize.X / 2)
-            local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
-
-            task.spawn(function()
-                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
-                task.wait(0.05)
-                pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
-                task.wait(0.02)
-                pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), true) end)
-                task.wait(0.05)
-                pcall(function() vim:SendTouchEvent(0, Vector2.new(clickX, clickY), false) end)
-            end)
-            successClicked = true
-        end
-    end)
+    -- ส่ง mouse event เฉพาะเมื่อ connection ไม่สำเร็จ หรือเพิ่มเติม
+    if not successClicked then
+        pcall(function()
+            local absPos, absSize = element.AbsolutePosition, element.AbsoluteSize
+            if absSize.X > 0 and absSize.Y > 0 then
+                local inset, _ = guiService:GetGuiInset()
+                local clickX = absPos.X + (absSize.X / 2)
+                local clickY = absPos.Y + (absSize.Y / 2) + inset.Y
+                -- [FIX] เช็ค screen bounds ป้องกันคลิกผิด UI
+                local vp = camera.ViewportSize
+                if clickX > 0 and clickY > 0 and clickX < vp.X and clickY < vp.Y then
+                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, true, game, 1) end)
+                    task.wait(0.05)
+                    pcall(function() vim:SendMouseButtonEvent(clickX, clickY, 0, false, game, 1) end)
+                    successClicked = true
+                end
+            end
+        end)
+    end
 
     return successClicked
 end
@@ -738,7 +746,7 @@ local function walkToTarget(targetPos, locationName)
             AgentCanJump    = true,
             AgentJumpHeight = 10,
             AgentMaxSlope   = 45,
-            WaypointSpacing = 6   -- เพิ่มจาก 4 → 6 ลด waypoint ถี่เกิน
+            WaypointSpacing = 6
         })
 
         local success, _ = pcall(function()
@@ -762,7 +770,6 @@ local function walkToTarget(targetPos, locationName)
 
             local wp = waypoints[i]
 
-            -- [FIX] กระโดด waypoint ที่ path กำหนด ใช้ ChangeState แทน hum.Jump
             if wp.Action == Enum.PathWaypointAction.Jump then
                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
                 task.wait(0.15)
@@ -778,7 +785,6 @@ local function walkToTarget(targetPos, locationName)
                                 - Vector3.new(wp.Position.X,   0, wp.Position.Z)).Magnitude
                 if distToWp < 4 then break end
 
-                -- [FIX] ตรวจ stuck ด้วย position delta (2.5 วิ) แทน timeout สุ่มกระโดด
                 if (root.Position - lastPos).Magnitude > 0.5 then
                     lastPos   = root.Position
                     stuckTick = tick()
@@ -790,7 +796,6 @@ local function walkToTarget(targetPos, locationName)
                     stuckTick = tick()
                 end
 
-                -- [FIX] เพิ่ม timeout waypoint จาก 4.0 → 6.0 วิ
                 if tick() - wpStartTick > 6.0 then break end
 
                 task.wait(0.1)
@@ -798,10 +803,8 @@ local function walkToTarget(targetPos, locationName)
         end
     end
 
-    -- walk ครั้งแรก
     computeAndWalk()
 
-    -- [FIX] ถ้ายังไม่ถึงจุดหมาย → compute path ใหม่แล้วลองอีกครั้ง
     local flatRoot   = Vector3.new(root.Position.X, 0, root.Position.Z)
     local flatTarget = Vector3.new(targetPos.X,     0, targetPos.Z)
     if autoFarmEnabled and (flatRoot - flatTarget).Magnitude > 6 then
@@ -940,7 +943,7 @@ local uiHeight = math.clamp(vpSize.Y - 50, 250, 460)
 local tabWidth = uiWidth < 450 and 120 or 160
 
 local Window = Fluent:CreateWindow({
-    Title = "XT-HUB [BETA]",
+    Title = "XT-HUB [1.3]",
     SubTitle = "Sol's RNG",
     TabWidth = tabWidth,
     Size = UDim2.fromOffset(uiWidth, uiHeight),
@@ -1167,94 +1170,9 @@ local FishStatusLabel = Tabs.Fishing:AddParagraph({ Title = "Status", Content = 
 local FishBagLabel = Tabs.Fishing:AddParagraph({ Title = "Fish Status", Content = "Rounds: " .. fishingRoundCount .. " / " .. targetFishCount })
 
 local DetectDebugLabel = Tabs.Fishing:AddParagraph({
-    Title = "🔍 Detect Status",
-    Content = "Fish UI: ❓  |  Minigame: ❓  |  Action: ❓"
+    Title = "🔍 Real-Time UI Diagnostics",
+    Content = "Diagnostics hidden. Enable 'Show Detect Overlay' to view real-time data."
 })
-
-task.spawn(function()
-    while task.wait(0.3) do
-        if not DetectDebugLabel then continue end
-        pcall(function()
-            local mainUI = playerGui:FindFirstChild("MainInterface")
-            if not mainUI then
-                DetectDebugLabel:SetDesc("MainInterface: ❌ Not Found")
-                return
-            end
-
-            local function getUIInfo(targetXOff, targetXScl)
-                for _, child in ipairs(mainUI:GetChildren()) do
-                    if child:IsA("GuiObject") and child.Visible then
-                        local xOff = child.Size.X.Offset
-                        local xScl = child.Size.X.Scale
-                        if math.abs(xOff - targetXOff) <= 2 or math.abs(xScl - targetXScl) <= 0.005 then
-                            local bg = child.BackgroundTransparency
-                            local active = bg <= 0.6
-                            return string.format("%.2f %s", bg, active and "✅" or "❌")
-                        end
-                    end
-                end
-                return "— (not found)"
-            end
-
-            local function getActionInfo()
-                for _, child in ipairs(mainUI:GetChildren()) do
-                    if child:IsA("GuiObject") and child.Visible then
-                        local xOff = child.Size.X.Offset
-                        local xScl = child.Size.X.Scale
-                        if math.abs(xOff - 250) <= 2 or math.abs(xScl - 0.185) <= 0.005 then
-                            local bg1 = child.BackgroundTransparency
-                            task.wait(0.08)
-                            local bg2 = child.BackgroundTransparency
-                            local active = bg1 <= 0.6
-                            local anim = math.abs(bg1 - bg2) >= 0.05
-                            return string.format("%.2f %s%s", bg1, active and "✅" or "❌", anim and " 🎬" or "")
-                        end
-                    end
-                end
-                return "— (not found)"
-            end
-
-            local fishInfo  = getUIInfo(201, 0.122)
-            local miniInfo  = getUIInfo(230, 0.140)
-            local actInfo   = getActionInfo()
-
-            DetectDebugLabel:SetDesc(
-                "Fish UI  : " .. fishInfo .. "\n" ..
-                "Minigame : " .. miniInfo .. "\n" ..
-                "Action   : " .. actInfo .. "\n" ..
-                "(🎬 = animating, กดยังไม่ได้)\n" ..
-                "UI Children: " .. #mainUI:GetChildren() .. " | Step: " .. fishingStep .. "\n" ..
-                "Action Position: " .. (function()
-                    local txt = "N/A"
-                    pcall(function()
-                        for _, lv1 in ipairs(mainUI:GetChildren()) do
-                            if lv1:IsA("ImageLabel") then
-                                for _, lv2 in ipairs(lv1:GetChildren()) do
-                                    if lv2:IsA("ImageLabel") then
-                                        for _, lv3 in ipairs(lv2:GetChildren()) do
-                                            if lv3:IsA("ImageButton") and lv3.Visible then
-                                                local pos = lv3.Position
-                                                local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
-                                                local xOffOK   = math.abs(pos.X.Offset)    < 5
-                                                local yOK      = math.abs(pos.Y.Scale)      < 0.05 and math.abs(pos.Y.Offset) < 5
-                                                local ready = xScaleOK and xOffOK and yOK
-                                                txt = string.format("{1,0},{%.2f,0} %s",
-                                                    pos.X.Offset,
-                                                    ready and "✅ Ready" or "⏳ Wait")
-                                                return
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                    end)
-                    return txt
-                end)()
-            )
-        end)
-    end
-end)
 
 local showDetectOverlay = false
 
@@ -1265,6 +1183,105 @@ local ShowDetectToggle = Tabs.Fishing:AddToggle("ShowDetectToggle", {
 ShowDetectToggle:OnChanged(function(Value)
     showDetectOverlay = Value
 end)
+
+task.spawn(function()
+    while task.wait(0.3) do
+        if not DetectDebugLabel then continue end
+        
+        if not showDetectOverlay then
+            pcall(function()
+                DetectDebugLabel:SetTitle("🔍 Real-Time UI Diagnostics")
+                DetectDebugLabel:SetDesc("Diagnostics hidden. Enable 'Show Detect Overlay' to view real-time data.")
+            end)
+            continue
+        end
+
+        pcall(function()
+            local mainUI = playerGui:FindFirstChild("MainInterface")
+            if not mainUI then
+                DetectDebugLabel:SetTitle("🔍 Detection Diagnostics [ERROR]")
+                DetectDebugLabel:SetDesc("System Error: MainInterface not found. Are you fully loaded into the game?")
+                return
+            end
+
+            local function checkUIState(targetXOff, targetXScl)
+                for _, child in ipairs(mainUI:GetChildren()) do
+                    if child:IsA("GuiObject") and child.Visible then
+                        local xOff = child.Size.X.Offset
+                        local xScl = child.Size.X.Scale
+                        if math.abs(xOff - targetXOff) <= 2 or math.abs(xScl - targetXScl) <= 0.005 then
+                            local bg = child.BackgroundTransparency
+                            return bg <= 0.6 and "Active ✅" or "Standby ⏳"
+                        end
+                    end
+                end
+                return "Not Detected ❌"
+            end
+
+            local function checkActionState()
+                for _, child in ipairs(mainUI:GetChildren()) do
+                    if child:IsA("GuiObject") and child.Visible then
+                        local xOff = child.Size.X.Offset
+                        local xScl = child.Size.X.Scale
+                        if math.abs(xOff - 250) <= 2 or math.abs(xScl - 0.185) <= 0.005 then
+                            local bg1 = child.BackgroundTransparency
+                            task.wait(0.08)
+                            local bg2 = child.BackgroundTransparency
+                            local isAnimating = math.abs(bg1 - bg2) >= 0.05
+                            local isActive = bg1 <= 0.6
+                            
+                            if isAnimating then
+                                return "Processing (Animating) 🔄"
+                            elseif isActive then
+                                return "Ready to Click ✅"
+                            else
+                                return "Standby ⏳"
+                            end
+                        end
+                    end
+                end
+                return "Not Detected ❌"
+            end
+
+            local fishStatus  = checkUIState(201, 0.122)
+            local miniStatus  = checkUIState(230, 0.140)
+            local actStatus   = checkActionState()
+
+            local actionPosStatus = "Unavailable"
+            pcall(function()
+                for _, lv1 in ipairs(mainUI:GetChildren()) do
+                    if lv1:IsA("ImageLabel") then
+                        for _, lv2 in ipairs(lv1:GetChildren()) do
+                            if lv2:IsA("ImageLabel") then
+                                for _, lv3 in ipairs(lv2:GetChildren()) do
+                                    if lv3:IsA("ImageButton") and lv3.Visible then
+                                        local pos = lv3.Position
+                                        local xScaleOK = math.abs(pos.X.Scale - 1) < 0.05
+                                        local xOffOK   = math.abs(pos.X.Offset)    < 5
+                                        local yOK      = math.abs(pos.Y.Scale)      < 0.05 and math.abs(pos.Y.Offset) < 5
+                                        local ready = xScaleOK and xOffOK and yOK
+                                        actionPosStatus = ready and "In Position ✅" or "Moving... 🔄"
+                                        return
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end)
+
+            DetectDebugLabel:SetTitle("🔍 Real-Time UI Diagnostics")
+            DetectDebugLabel:SetDesc(
+                "▶ Fishing Interface    :  " .. fishStatus .. "\n" ..
+                "▶ Minigame Event       :  " .. miniStatus .. "\n" ..
+                "▶ Action Button        :  " .. actStatus .. "\n" ..
+                "▶ Button Alignment     :  " .. actionPosStatus .. "\n\n" ..
+                "Current Sequence Step  :  " .. tostring(fishingStep)
+            )
+        end)
+    end
+end)
+
 
 local overlayGui = Instance.new("ScreenGui")
 overlayGui.Name = "DetectOverlayGui"
@@ -1587,7 +1604,7 @@ IncognitoToggle:OnChanged(function(Value)
     end
 end)
 
-Tabs.Webhook:AddParagraph({ Title = "Information", Content = "Developed by XT-HUB [BETA]" })
+Tabs.Webhook:AddParagraph({ Title = "Information", Content = "Developed by XT-HUB [1.3]" })
 
 Window:SelectTab(1)
 
@@ -2753,11 +2770,11 @@ task.spawn(function()
 
                                 -- ==========================================
                                 -- [PATCHED] Inner Sell Loop — ขายจนกระเป๋าว่าง
+                                -- [FIX] สุ่มเลือกเฉพาะ 4 ช่องแรก (แถวบน) ป้องกัน UI บีบมือถือจอเล็ก
                                 -- ==========================================
                                 local emptyBagCheck = 0
                                 local innerLoopStart = tick()
                                 local sellAllMissCount = 0
-                                -- [FIX] timeout เพิ่มจาก 35 → 120 วิ รองรับขายหลายชนิด
                                 while autoFarmEnabled and isSellingProcess do
                                     if tick() - innerLoopStart > 120 then
                                         if FishStatusLabel then FishStatusLabel:SetDesc("Bag Timeout! Exiting...") end
@@ -2801,7 +2818,9 @@ task.spawn(function()
 
                                         if #items > 0 then
                                             emptyBagCheck = 0
-                                            local randomItem = items[math.random(1, #items)]
+                                            -- [FIX] สุ่มเลือกเฉพาะ 4 ช่องแรก (แถวบน) ป้องกัน UI บีบจอมือถือเล็ก
+                                            local topRowCount = math.min(4, #items)
+                                            local randomItem = items[math.random(1, topRowCount)]
                                             pcall(function() scrollFrame.CanvasPosition = Vector2.new(0, 0) end)
                                             task.wait(0.2)
 
@@ -2886,15 +2905,13 @@ task.spawn(function()
                                                 if targetConfirmBtn then
                                                     task.wait(0.3)
                                                     forceCraftClick(targetConfirmBtn)
-                                                    task.wait(0.8) -- รอ UI refresh ก่อนหา item ถัดไป
-                                                    -- [FIX] ไม่มี break → loop วนต่อขายไอเทมถัดไปจนกระเป๋าว่าง
-                                                    sellAllMissCount = 0  -- reset miss count เมื่อ confirm สำเร็จ
+                                                    task.wait(0.8)
+                                                    sellAllMissCount = 0
                                                     if FishStatusLabel then FishStatusLabel:SetDesc("Sold Item! Checking for more...") end
                                                 else
                                                     task.wait(0.3)
                                                 end
                                             else
-                                                -- [FIX] นับ miss ถ้าเกิน 5 ค่อย break
                                                 sellAllMissCount = sellAllMissCount + 1
                                                 if sellAllMissCount >= 5 then
                                                     if FishStatusLabel then FishStatusLabel:SetDesc("Sell All button not found! Exiting...") end
@@ -2903,7 +2920,6 @@ task.spawn(function()
                                                 task.wait(0.4)
                                             end
                                         else
-                                            -- [FIX] กระเป๋าว่าง → นับ 3 ครั้งแล้ว break
                                             emptyBagCheck = emptyBagCheck + 1
                                             if FishStatusLabel then FishStatusLabel:SetDesc("Checking Bag (" .. emptyBagCheck .. "/3)...") end
                                             if emptyBagCheck >= 3 then
@@ -3016,6 +3032,16 @@ task.spawn(function()
                 if FishBagLabel then FishBagLabel:SetDesc("Rounds: " .. fishingRoundCount .. " / " .. targetFishCount) end
                 if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Returning to Fish...") end
 
+                -- [ADD] กด Choice[3] กันบัค Dialog ค้างก่อนเดินกลับ
+                pcall(function()
+                    local choices = game:GetService("Players").LocalPlayer.PlayerGui.MainInterface.Dialog.Choices
+                    local choiceList = choices:GetChildren()
+                    if choiceList[3] then
+                        forceCraftClick(choiceList[3])
+                    end
+                end)
+                task.wait(0.3)
+
                 ClearFishingCache()
                 task.wait(0.3)
             end
@@ -3064,57 +3090,62 @@ local CLICK_RATE_FAR  = 0.05
 local CLICK_RATE_MID  = 0.07
 local CLICK_RATE_NEAR = 0.12
 
-RunService.Heartbeat:Connect(function(deltaTime)
-    if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI or not DetectMinigame_ON then
-        if isMinigameActive then
-            isMinigameActive = false
-        end
-        return
-    end
-
-    pcall(function()
-        local safeZoneBar, diamondIcon = getExactMinigameElements()
-
-        if safeZoneBar and safeZoneBar.Visible then
-            isMinigameActive = true 
-            hasMinigameMoved = true 
-
-            if diamondIcon and diamondIcon.Visible then
-                local overlapping = isOverlapping(diamondIcon, safeZoneBar)
-                local distance = math.abs((diamondIcon.AbsolutePosition.X + diamondIcon.AbsoluteSize.X / 2) - (safeZoneBar.AbsolutePosition.X + safeZoneBar.AbsoluteSize.X / 2))
-                local currentTime = tick()
-
-                if overlapping then
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Target Locked") end
-                elseif distance > FAR_THRESHOLD then
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Far (Spamming)") end
-                    if currentTime - lastClickTime > CLICK_RATE_FAR then
-                        clickOnce()
-                        lastClickTime = currentTime
-                    end
-                elseif distance > MID_THRESHOLD then
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Medium") end
-                    if currentTime - lastClickTime > CLICK_RATE_MID then
-                        clickOnce()
-                        lastClickTime = currentTime
-                    end
-                else
-                    if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Near") end
-                    if currentTime - lastClickTime > CLICK_RATE_NEAR then
-                        clickOnce()
-                        lastClickTime = currentTime
-                    end
-                end
-            else
-                if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Minigame...") end
-            end
-        else
+-- [FIX] เปลี่ยน RunService.Heartbeat → task loop 0.05s
+-- Heartbeat รันทุก frame (60fps) ทำ GetDescendants ตลอดคืน = แลค
+-- task.wait(0.05) = 20fps เพียงพอสำหรับ minigame และประหยัด CPU มาก
+task.spawn(function()
+    while task.wait(0.05) do
+        if not autoFarmEnabled or not isAtTarget or isSellingProcess or isResettingUI or not DetectMinigame_ON then
             if isMinigameActive then
                 isMinigameActive = false
-                if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Fish...") end
             end
+            continue
         end
-    end)
+
+        pcall(function()
+            local safeZoneBar, diamondIcon = getExactMinigameElements()
+
+            if safeZoneBar and safeZoneBar.Visible then
+                isMinigameActive = true
+                hasMinigameMoved = true
+
+                if diamondIcon and diamondIcon.Visible then
+                    local overlapping = isOverlapping(diamondIcon, safeZoneBar)
+                    local distance = math.abs((diamondIcon.AbsolutePosition.X + diamondIcon.AbsoluteSize.X / 2) - (safeZoneBar.AbsolutePosition.X + safeZoneBar.AbsoluteSize.X / 2))
+                    local currentTime = tick()
+
+                    if overlapping then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Target Locked") end
+                    elseif distance > FAR_THRESHOLD then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Far (Spamming)") end
+                        if currentTime - lastClickTime > CLICK_RATE_FAR then
+                            clickOnce()
+                            lastClickTime = currentTime
+                        end
+                    elseif distance > MID_THRESHOLD then
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Medium") end
+                        if currentTime - lastClickTime > CLICK_RATE_MID then
+                            clickOnce()
+                            lastClickTime = currentTime
+                        end
+                    else
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Distance: Near") end
+                        if currentTime - lastClickTime > CLICK_RATE_NEAR then
+                            clickOnce()
+                            lastClickTime = currentTime
+                        end
+                    end
+                else
+                    if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Minigame...") end
+                end
+            else
+                if isMinigameActive then
+                    isMinigameActive = false
+                    if FishStatusLabel then FishStatusLabel:SetDesc("Waiting for Fish...") end
+                end
+            end
+        end)
+    end
 end)
 
 local lastFishingStepTime = tick()
@@ -3378,6 +3409,12 @@ task.spawn(function()
                     if isPositionReady then
                         if FishStatusLabel then FishStatusLabel:SetDesc("Clicking Action...") end
 
+                        -- [FIX] ลบ parallel actionClickActive loop ออก
+                        -- เหตุผล: loop ซ้อนกับ main loop ทำให้กด 2 ครั้งพร้อมกัน
+                        -- โดน UI อื่น และ spawn coroutine ค้างถ้า actionClickActive ไม่ถูก clear
+                        -- ใช้แค่ main loop เดิมที่จำกัด attempt เพียงพอแล้ว
+
+                        -- ระบบเดิม: กดแบบ loop จำกัด attempt
                         local maxAttempts = 10
                         for i = 1, maxAttempts do
                             local stillReady = false
@@ -3425,8 +3462,8 @@ task.spawn(function()
                         if FishStatusLabel then FishStatusLabel:SetDesc("Checking Rounds...") end
                         fishingRoundCount = fishingRoundCount + 1
 
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Waiting 1.5s for Item...") end
-                        task.wait(1.5)
+                        if FishStatusLabel then FishStatusLabel:SetDesc("Waiting 0.5s for Item...") end
+                        task.wait(0.5)
 
                         fishingStep = 4
                         lastFishingStepTime = tick()
