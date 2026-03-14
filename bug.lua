@@ -2618,6 +2618,8 @@ task.spawn(function()
                     if char:FindFirstChild("Humanoid") then char.Humanoid:MoveTo(root.Position) end
                     task.wait(0.3)
 
+                    -- [FIX] Cache proximity prompt ไว้ เพื่อใช้ปิด Dialog หลัง sell เสร็จ
+                    local cachedSellPrompt = nil
                     pcall(function()
                         local promptFired = false
                         for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -2628,6 +2630,7 @@ task.spawn(function()
                                         if fireproximityprompt then
                                             fireproximityprompt(obj, 1)
                                             fireproximityprompt(obj, 0)
+                                            cachedSellPrompt = obj  -- cache ไว้ใช้ตอนปิด
                                             promptFired = true
                                         end
                                     end
@@ -2983,7 +2986,26 @@ task.spawn(function()
                                 hasCompletedSell = true
                                 totalSellCount = totalSellCount + 1
                                 task.wait(0.5)
-                            elseif #validChoices > 0 then
+
+                                -- [FIX] กด Leave (choice ตัวที่ 3) เพื่อปิด Dialog NPC หลังปิด Sell UI
+                                task.wait(0.3)
+                                pcall(function()
+                                    local dlg2 = mainUI:FindFirstChild("Dialog")
+                                    if not (dlg2 and dlg2.Visible) then return end
+                                    local choices2 = dlg2:FindFirstChild("Choices")
+                                    if not choices2 then return end
+                                    local btns2 = {}
+                                    for _, child in ipairs(choices2:GetChildren()) do
+                                        if child:IsA("GuiButton") or child:IsA("TextButton") or child:IsA("ImageButton") then
+                                            table.insert(btns2, child)
+                                        end
+                                    end
+                                    table.sort(btns2, function(a, b)
+                                        return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
+                                    end)
+                                    local leaveBtn2 = btns2[3] or btns2[#btns2]
+                                    if leaveBtn2 then forceCraftClick(leaveBtn2) end
+                                end)
                                 forceCraftClick(validChoices[#validChoices])
                                 hasCompletedSell = true
                                 totalSellCount = totalSellCount + 1
@@ -3046,42 +3068,35 @@ task.spawn(function()
                 if FishBagLabel then FishBagLabel:SetDesc("Rounds: " .. fishingRoundCount .. " / " .. targetFishCount) end
                 if FishStatusLabel then FishStatusLabel:SetDesc("Sell Done! Closing Dialog...") end
 
-                -- [FIX] ปิด Dialog อย่างถูกต้อง แทนการกด choiceList[3] แบบ hardcode
-                -- เดิม: choiceList[3] อาจ nil หรือไม่ใช่ปุ่มปิด ทำให้ Dialog ค้างแล้วไปโดนตอนกด Fish
+                -- [FIX] ปิด Dialog NPC หลัง sell เสร็จ
+                -- path ตายตัว: MainInterface.Dialog.Choices → 3 children = [Open Shop, Sell Fish, Leave]
+                -- Leave อยู่ตัวที่ 3 เสมอ แต่ต้อง sort ด้วย LayoutOrder ก่อน เพราะ GetChildren() ไม่การันตีลำดับ
                 local function closeDialogSafely()
-                    local mainUI = playerGui:FindFirstChild("MainInterface")
-                    if not mainUI then return end
+                    local mainUI2 = playerGui:FindFirstChild("MainInterface")
+                    if not mainUI2 then return end
+                    local dlg = mainUI2:FindFirstChild("Dialog")
+                    if not (dlg and dlg.Visible) then return end
+                    local choices = dlg:FindFirstChild("Choices")
+                    if not choices then return end
 
-                    -- ลอง 1: กดปุ่ม Close/X ใน Dialog โดยตรง
-                    pcall(function()
-                        local dlg = mainUI:FindFirstChild("Dialog")
-                        if dlg and dlg.Visible then
-                            for _, desc in ipairs(dlg:GetDescendants()) do
-                                if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
-                                    local t = desc.Text:lower():gsub("%s+","")
-                                    if t == "x" or t == "close" or t == "ปิด" then
-                                        local btn = desc:IsA("GuiButton") and desc or desc.Parent
-                                        if btn and btn:IsA("GuiButton") then
-                                            forceCraftClick(btn)
-                                            return
-                                        end
-                                    end
-                                end
-                            end
+                    local btns = {}
+                    for _, child in ipairs(choices:GetChildren()) do
+                        if child:IsA("GuiButton") or child:IsA("TextButton") or child:IsA("ImageButton") then
+                            table.insert(btns, child)
                         end
+                    end
+                    -- sort ด้วย LayoutOrder เพื่อให้ลำดับถูกต้อง
+                    table.sort(btns, function(a, b)
+                        return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
                     end)
-                    task.wait(0.3)
-
-                    -- ลอง 2: กด ESC เพื่อปิด Dialog
-                    pcall(function()
-                        local dlg = mainUI:FindFirstChild("Dialog")
-                        if dlg and dlg.Visible then
-                            vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
-                            task.wait(0.1)
-                            vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
-                        end
-                    end)
-                    task.wait(0.3)
+                    -- Leave = ตัวที่ 3 (index สุดท้าย)
+                    if #btns >= 3 then
+                        forceCraftClick(btns[3])
+                        task.wait(0.3)
+                    elseif #btns > 0 then
+                        forceCraftClick(btns[#btns])
+                        task.wait(0.3)
+                    end
                 end
 
                 closeDialogSafely()
@@ -3308,40 +3323,29 @@ task.spawn(function()
             if fishingStep == 0 then
                 resetRecovery(0)
 
-                -- [FIX] ตรวจ Dialog NPC ค้างก่อนทุกอย่าง
-                -- ปัญหา: หลัง sell เสร็จ Dialog อาจยังค้างอยู่
-                -- ถ้ากด Fish button ในขณะที่ Dialog เปิดอยู่ จะไปโดน Dialog แทน
+                -- [FIX] ตรวจ Dialog NPC ค้างก่อนทุกอย่าง กด Leave (choice[3]) เพื่อปิด
                 pcall(function()
                     local dlg = mainUI:FindFirstChild("Dialog")
-                    if dlg and dlg.Visible then
-                        if FishStatusLabel then FishStatusLabel:SetDesc("Closing Dialog before Fish...") end
-                        -- ลอง 1: หาปุ่ม Close/X ใน Dialog
-                        local closed = false
-                        for _, desc in ipairs(dlg:GetDescendants()) do
-                            if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and desc.Visible then
-                                local t = desc.Text:lower():gsub("%s+","")
-                                if t == "x" or t == "close" or t == "ปิด" then
-                                    local btn = desc:IsA("GuiButton") and desc or desc.Parent
-                                    if btn and btn:IsA("GuiButton") then
-                                        forceCraftClick(btn)
-                                        closed = true
-                                        break
-                                    end
-                                end
+                    if not (dlg and dlg.Visible) then return end
+                    if FishStatusLabel then FishStatusLabel:SetDesc("Closing Dialog before Fish...") end
+                    local choices = dlg:FindFirstChild("Choices")
+                    if choices then
+                        local btns = {}
+                        for _, child in ipairs(choices:GetChildren()) do
+                            if child:IsA("GuiButton") or child:IsA("TextButton") or child:IsA("ImageButton") then
+                                table.insert(btns, child)
                             end
                         end
-                        if not closed then
-                            -- ลอง 2: กด ESC
-                            vim:SendKeyEvent(true, Enum.KeyCode.Escape, false, game)
-                            task.wait(0.1)
-                            vim:SendKeyEvent(false, Enum.KeyCode.Escape, false, game)
-                        end
-                        task.wait(0.4)
-                        -- ถ้า Dialog ยังอยู่ ให้ step reset รอรอบถัดไป
-                        if dlg.Visible then
-                            lastFishingStepTime = tick()
-                            return
-                        end
+                        table.sort(btns, function(a, b)
+                            return (a.LayoutOrder or 0) < (b.LayoutOrder or 0)
+                        end)
+                        local leaveBtn = btns[3] or btns[#btns]
+                        if leaveBtn then forceCraftClick(leaveBtn) end
+                    end
+                    task.wait(0.4)
+                    if dlg.Visible then
+                        lastFishingStepTime = tick()
+                        return
                     end
                 end)
 
